@@ -1,0 +1,51 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Project-local IDE state
+.vscode/
+*.code-workspace
+
+# STM32Cube / Eclipse metadata
+.settings/
+
+# MDK-ARM user-specific files
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvguix.*
+
+# MDK-ARM generated folders
+MDK-ARM/.vscode/
+MDK-ARM/.eide/
+MDK-ARM/.cmsis/
+MDK-ARM/build/
+MDK-ARM/DebugConfig/
+MDK-ARM/ProjectFusionBoard/
+
+# MDK-ARM build outputs that may also appear at the project root
+*.axf
+*.bin
+*.crf
+*.d
+*.dep
+*.hex
+*.htm
+*.lnp
+*.lst
+*.map
+*.o
+
+# Keep generated RTE content out except the component header the project includes
+MDK-ARM/RTE/*
+!MDK-ARM/RTE/_ProjectFusionBoard/
+!MDK-ARM/RTE/_ProjectFusionBoard/RTE_Components.h
+
+# Keep only the CMSIS pieces this project actually includes
+Drivers/CMSIS/Core/
+Drivers/CMSIS/Core_A/
+Drivers/CMSIS/Device/ST/STM32F1xx/Source/Templates/
+Drivers/CMSIS/DSP/
+Drivers/CMSIS/Lib/
+Drivers/CMSIS/NN/
+Drivers/CMSIS/RTOS/
+Drivers/CMSIS/RTOS2/
+Drivers/CMSIS/docs/
