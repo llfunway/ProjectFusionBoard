@@ -462,18 +462,15 @@ AD7177_Status_t AD7177_ReadData(AD7177_Handle_t *had7177, uint8_t channel, int32
     return AD7177_ERROR_COMM;
   }
   
-  /* Extract 24-bit data and sign-extend to 32-bit */
-  int32_t adcData = (int32_t)(rawData & 0xFFFFFF);
-  if (adcData & 0x800000)
-  {
-    adcData |= 0xFF000000;  // Sign extension for negative values
-  }
+  /* In bipolar mode, AD7177 output coding is offset binary: midscale is 0 V. */
+  int64_t bipolarCode = (int64_t)rawData - 2147483648LL;
+  int32_t adcData = (int32_t)bipolarCode;
   
   *pData = adcData;
   had7177->RawData[channel] = adcData;
   
   /* Convert to voltage */
-  float voltage = ((float)adcData / 8388608.0f) * had7177->Config.ReferenceVoltage_mV;
+  float voltage = ((float)bipolarCode / 2147483648.0f) * had7177->Config.ReferenceVoltage_mV;
   had7177->VoltageData[channel] = voltage / 1000.0f;  // Convert mV to V
   
   return AD7177_OK;

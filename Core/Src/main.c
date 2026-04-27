@@ -47,6 +47,10 @@
 #define IMU_READ_PERIOD_MS      ((uint32_t)(1000U / IMU_FREQUENCY_HZ))
 #define TEST_REPORT_PERIOD_MS   ADC_READ_PERIOD_MS
 #define AD7177_DEVICE_COUNT     ((uint8_t)3)
+#define MAG_FRONTEND_SCALE      ((float)4.0f)
+#define MAG_SENSOR_V_PER_GS     ((float)10.0f)
+#define MAG_NT_PER_GS           ((float)100000.0f)
+#define MAG_ADC_V_TO_NT         ((MAG_FRONTEND_SCALE / MAG_SENSOR_V_PER_GS) * MAG_NT_PER_GS)
 
 #define AD7177_CS1_PORT         GPIOC
 #define AD7177_CS1_PIN          GPIO_PIN_12
@@ -87,6 +91,7 @@ static uint32_t lastTestReport = 0;
 static uint32_t lastImuRead = 0;
 
 static float adc_voltage[AD7177_DEVICE_COUNT] = {0.0f};
+static float mag_nt[AD7177_DEVICE_COUNT] = {0.0f};
 static float imu_roll = 0.0f;
 static float imu_pitch = 0.0f;
 static float imu_temperature = 0.0f;
@@ -145,7 +150,7 @@ static void UART_SendFrequencyInfo(void)
 
 static void UART_SendDataHeader(void)
 {
-  UART_SendString("adc1\tadc2\tadc3\troll\tpitch\tvertical_proj\r\n");
+  UART_SendString("b1_nT\tb2_nT\tb3_nT\troll\tpitch\tvertical_proj_nT\r\n");
 }
 
 static void UART_SendMpuInitDebug(void)
@@ -400,9 +405,14 @@ static void Process_Sensor_Data(void)
   const float ez_y = sinf(roll_rad) * cosf(pitch_rad);
   const float ez_z = cosf(roll_rad) * cosf(pitch_rad);
 
-  vertical_proj = (adc_voltage[0] * ez_x) +
-                  (adc_voltage[1] * ez_y) +
-                  (adc_voltage[2] * ez_z);
+  for (uint8_t i = 0; i < AD7177_DEVICE_COUNT; i++)
+  {
+    mag_nt[i] = adc_voltage[i] * MAG_ADC_V_TO_NT;
+  }
+
+  vertical_proj = (mag_nt[0] * ez_x) +
+                  (mag_nt[1] * ez_y) +
+                  (mag_nt[2] * ez_z);
 }
 
 static void Process_Test_Report(void)
@@ -412,9 +422,9 @@ static void Process_Test_Report(void)
       txBuf,
       sizeof(txBuf),
       "%.6f\t%.6f\t%.6f\t%.3f\t%.3f\t%.6f\r\n",
-      adc_voltage[0],
-      adc_voltage[1],
-      adc_voltage[2],
+      mag_nt[0],
+      mag_nt[1],
+      mag_nt[2],
       imu_roll,
       imu_pitch,
       vertical_proj);
