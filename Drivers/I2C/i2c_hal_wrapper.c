@@ -47,21 +47,18 @@ int8_t I2C_WriteByte(I2C_Device_TypeDef *hi2c_dev,
                      uint8_t regAddr, 
                      uint8_t data)
 {
-  uint8_t txBuffer[2];
-  
   if (hi2c_dev == NULL || hi2c_dev->hi2c == NULL)
   {
     return I2C_ERROR_PARAM;
   }
-  
-  txBuffer[0] = regAddr;
-  txBuffer[1] = data;
-  
-  if (HAL_I2C_Master_Transmit(hi2c_dev->hi2c, 
-                               hi2c_dev->DevAddress, 
-                               txBuffer, 
-                               2, 
-                               hi2c_dev->Timeout) != HAL_OK)
+
+  if (HAL_I2C_Mem_Write(hi2c_dev->hi2c,
+                        hi2c_dev->DevAddress,
+                        regAddr,
+                        I2C_MEMADD_SIZE_8BIT,
+                        &data,
+                        1,
+                        hi2c_dev->Timeout) != HAL_OK)
   {
     return I2C_ERROR_TIMEOUT;
   }
@@ -81,22 +78,13 @@ int8_t I2C_ReadByte(I2C_Device_TypeDef *hi2c_dev,
     return I2C_ERROR_PARAM;
   }
   
-  /* Write register address first */
-  if (HAL_I2C_Master_Transmit(hi2c_dev->hi2c, 
-                               hi2c_dev->DevAddress, 
-                               &regAddr, 
-                               1, 
-                               hi2c_dev->Timeout) != HAL_OK)
-  {
-    return I2C_ERROR_TIMEOUT;
-  }
-  
-  /* Read data byte */
-  if (HAL_I2C_Master_Receive(hi2c_dev->hi2c, 
-                              hi2c_dev->DevAddress, 
-                              pData, 
-                              1, 
-                              hi2c_dev->Timeout) != HAL_OK)
+  if (HAL_I2C_Mem_Read(hi2c_dev->hi2c,
+                       hi2c_dev->DevAddress,
+                       regAddr,
+                       I2C_MEMADD_SIZE_8BIT,
+                       pData,
+                       1,
+                       hi2c_dev->Timeout) != HAL_OK)
   {
     return I2C_ERROR_TIMEOUT;
   }
@@ -112,39 +100,23 @@ int8_t I2C_WriteBytes(I2C_Device_TypeDef *hi2c_dev,
                       uint8_t *pData, 
                       uint16_t size)
 {
-  uint8_t *txBuffer;
-  int8_t ret = I2C_OK;
-  uint16_t i;
-  
   if (hi2c_dev == NULL || hi2c_dev->hi2c == NULL || pData == NULL || size == 0)
   {
     return I2C_ERROR_PARAM;
   }
-  
-  /* Allocate temporary buffer */
-  txBuffer = (uint8_t *)malloc(size + 1);
-  if (txBuffer == NULL)
+
+  if (HAL_I2C_Mem_Write(hi2c_dev->hi2c,
+                        hi2c_dev->DevAddress,
+                        regAddr,
+                        I2C_MEMADD_SIZE_8BIT,
+                        pData,
+                        size,
+                        hi2c_dev->Timeout) != HAL_OK)
   {
-    return I2C_ERROR_BUS;
+    return I2C_ERROR_TIMEOUT;
   }
-  
-  txBuffer[0] = regAddr;
-  for (i = 0; i < size; i++)
-  {
-    txBuffer[i + 1] = pData[i];
-  }
-  
-  if (HAL_I2C_Master_Transmit(hi2c_dev->hi2c, 
-                               hi2c_dev->DevAddress, 
-                               txBuffer, 
-                               size + 1, 
-                               hi2c_dev->Timeout) != HAL_OK)
-  {
-    ret = I2C_ERROR_TIMEOUT;
-  }
-  
-  free(txBuffer);
-  return ret;
+
+  return I2C_OK;
 }
 
 /**
@@ -160,22 +132,13 @@ int8_t I2C_ReadBytes(I2C_Device_TypeDef *hi2c_dev,
     return I2C_ERROR_PARAM;
   }
   
-  /* Write register address first */
-  if (HAL_I2C_Master_Transmit(hi2c_dev->hi2c, 
-                               hi2c_dev->DevAddress, 
-                               &regAddr, 
-                               1, 
-                               hi2c_dev->Timeout) != HAL_OK)
-  {
-    return I2C_ERROR_TIMEOUT;
-  }
-  
-  /* Read data bytes */
-  if (HAL_I2C_Master_Receive(hi2c_dev->hi2c, 
-                              hi2c_dev->DevAddress, 
-                              pData, 
-                              size, 
-                              hi2c_dev->Timeout) != HAL_OK)
+  if (HAL_I2C_Mem_Read(hi2c_dev->hi2c,
+                       hi2c_dev->DevAddress,
+                       regAddr,
+                       I2C_MEMADD_SIZE_8BIT,
+                       pData,
+                       size,
+                       hi2c_dev->Timeout) != HAL_OK)
   {
     return I2C_ERROR_TIMEOUT;
   }

@@ -26,11 +26,34 @@
 
 #define TEMP_SENSITIVITY              (340.0f)
 #define TEMP_OFFSET                   (36.53f)
+#define MPU6050_ALIGN_STARTUP_DELAY_MS    (200U)
+#define MPU6050_ALIGN_DISCARD_COUNT       (32U)
+#define MPU6050_ALIGN_SAMPLE_COUNT        (128U)
+#define MPU6050_ALIGN_MIN_VALID_SAMPLES   (24U)
+#define MPU6050_ALIGN_MAX_ATTEMPTS        (320U)
+#define MPU6050_ALIGN_SAMPLE_DELAY_MS     (2U)
+#define MPU6050_ALIGN_ACCEL_TOLERANCE_G   (0.12f)
+#define MPU6050_ALIGN_GYRO_TOLERANCE_DPS  (3.0f)
+#define MPU6050_ACCEL_GATE_MIN_G          (0.85f)
+#define MPU6050_ACCEL_GATE_MAX_G          (1.15f)
+#define MPU6050_ACCEL_FULL_TRUST_DELTA_G  (0.03f)
+#define MPU6050_ACCEL_ZERO_TRUST_DELTA_G  (0.20f)
+#define MPU6050_STARTUP_BOOST_MS          (800U)
+#define MPU6050_NOMINAL_TWO_KP            (1.0f)
+#define MPU6050_NOMINAL_TWO_KI            (0.1f)
+#define MPU6050_BOOST_TWO_KP              (6.0f)
+#define MPU6050_BOOST_TWO_KI              (0.0f)
+#define MPU6050_FALLBACK_SAMPLE_COUNT     (16U)
+#define MPU6050_STATIC_ACCEL_TOLERANCE_G  (0.05f)
+#define MPU6050_STATIC_GYRO_TOLERANCE_DPS (1.5f)
+#define MPU6050_GYRO_BIAS_ADAPT_ALPHA     (0.02f)
 
 /* Private Function Prototypes -----------------------------------------------*/
 static float MPU6050_GetAccelSensitivity(uint8_t range);
 static float MPU6050_GetGyroSensitivity(uint8_t range);
 static void MPU6050_MahonyInit(MPU6050_Handle_t *hmpu);
+static MPU6050_Status_t MPU6050_InitAttitudeFromAccel(MPU6050_Handle_t *hmpu);
+static void MPU6050_SetQuaternionFromRollPitch(MPU6050_Handle_t *hmpu, float roll_rad, float pitch_rad);
 static float MPU6050_InvSqrt(float x);
 
 /* Public Functions ----------------------------------------------------------*/
@@ -115,6 +138,13 @@ MPU6050_Status_t MPU6050_Init(MPU6050_Handle_t *hmpu, MPU6050_Config_t *pConfig)
   MPU6050_MahonyInit(hmpu);
   hmpu->IsInitialized = 1;
 
+  HAL_Delay(MPU6050_ALIGN_STARTUP_DELAY_MS);
+  if (MPU6050_InitAttitudeFromAccel(hmpu) != MPU6050_OK)
+  {
+    hmpu->IsInitialized = 0;
+    return MPU6050_ERROR_TIMEOUT;
+  }
+
   return MPU6050_OK;
 }
 
@@ -143,6 +173,13 @@ MPU6050_Status_t MPU6050_ReadRawData(MPU6050_Handle_t *hmpu)
   hmpu->RawData.GyroX = (int16_t)((buffer[8] << 8) | buffer[9]);
   hmpu->RawData.GyroY = (int16_t)((buffer[10] << 8) | buffer[11]);
   hmpu->RawData.GyroZ = (int16_t)((buffer[12] << 8) | buffer[13]);
+
+  hmpu->RawData.AccelX = (int16_t)(hmpu->RawData.AccelX - hmpu->Calibration.AccelOffsetX);
+  hmpu->RawData.AccelY = (int16_t)(hmpu->RawData.AccelY - hmpu->Calibration.AccelOffsetY);
+  hmpu->RawData.AccelZ = (int16_t)(hmpu->RawData.AccelZ - hmpu->Calibration.AccelOffsetZ);
+  hmpu->RawData.GyroX = (int16_t)(hmpu->RawData.GyroX - hmpu->Calibration.GyroOffsetX);
+  hmpu->RawData.GyroY = (int16_t)(hmpu->RawData.GyroY - hmpu->Calibration.GyroOffsetY);
+  hmpu->RawData.GyroZ = (int16_t)(hmpu->RawData.GyroZ - hmpu->Calibration.GyroOffsetZ);
 
   accelScale = MPU6050_GetAccelSensitivity(hmpu->Config.AccelRange);
   gyroScale = MPU6050_GetGyroSensitivity(hmpu->Config.GyroRange);
@@ -173,11 +210,16 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
   float halfex;
   float halfey;
   float halfez;
+  float accelWeight = 0.0f;
+  float accelDelta;
   float qa;
   float qb;
   float qc;
   float sinp;
   uint32_t currentTime;
+  float accelNormSq;
+  float accelNorm;
+  float gyroMagDps;
 
   if (hmpu == NULL || !hmpu->IsInitialized)
   {
@@ -185,6 +227,13 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
   }
 
   currentTime = HAL_GetTick();
+  if ((hmpu->startupBoostUntil != 0U) && ((int32_t)(currentTime - hmpu->startupBoostUntil) >= 0))
+  {
+    hmpu->twoKp = hmpu->nominalTwoKp;
+    hmpu->twoKi = hmpu->nominalTwoKi;
+    hmpu->startupBoostUntil = 0U;
+  }
+
   hmpu->dt = (float)(currentTime - hmpu->lastTime) / 1000.0f;
   hmpu->lastTime = currentTime;
 
@@ -196,13 +245,44 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
   ax = hmpu->Data.AccelX;
   ay = hmpu->Data.AccelY;
   az = hmpu->Data.AccelZ;
-  gx = hmpu->Data.GyroX * ((float)M_PI / 180.0f);
-  gy = hmpu->Data.GyroY * ((float)M_PI / 180.0f);
-  gz = hmpu->Data.GyroZ * ((float)M_PI / 180.0f);
+  gx = (hmpu->Data.GyroX - hmpu->runtimeGyroBiasX) * ((float)M_PI / 180.0f);
+  gy = (hmpu->Data.GyroY - hmpu->runtimeGyroBiasY) * ((float)M_PI / 180.0f);
+  gz = (hmpu->Data.GyroZ - hmpu->runtimeGyroBiasZ) * ((float)M_PI / 180.0f);
 
-  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f)))
+  accelNormSq = (ax * ax) + (ay * ay) + (az * az);
+  accelNorm = sqrtf(accelNormSq);
+  accelDelta = fabsf(accelNorm - 1.0f);
+  gyroMagDps = sqrtf((hmpu->Data.GyroX * hmpu->Data.GyroX) +
+                     (hmpu->Data.GyroY * hmpu->Data.GyroY) +
+                     (hmpu->Data.GyroZ * hmpu->Data.GyroZ));
+
+  if (accelDelta <= MPU6050_ACCEL_FULL_TRUST_DELTA_G)
   {
-    recipNorm = MPU6050_InvSqrt(ax * ax + ay * ay + az * az);
+    accelWeight = 1.0f;
+  }
+  else if (accelDelta < MPU6050_ACCEL_ZERO_TRUST_DELTA_G)
+  {
+    accelWeight = 1.0f - ((accelDelta - MPU6050_ACCEL_FULL_TRUST_DELTA_G) /
+                          (MPU6050_ACCEL_ZERO_TRUST_DELTA_G - MPU6050_ACCEL_FULL_TRUST_DELTA_G));
+  }
+
+  if ((accelDelta <= MPU6050_STATIC_ACCEL_TOLERANCE_G) &&
+      (gyroMagDps <= MPU6050_STATIC_GYRO_TOLERANCE_DPS))
+  {
+    hmpu->runtimeGyroBiasX += MPU6050_GYRO_BIAS_ADAPT_ALPHA * hmpu->Data.GyroX;
+    hmpu->runtimeGyroBiasY += MPU6050_GYRO_BIAS_ADAPT_ALPHA * hmpu->Data.GyroY;
+    hmpu->runtimeGyroBiasZ += MPU6050_GYRO_BIAS_ADAPT_ALPHA * hmpu->Data.GyroZ;
+    gx = (hmpu->Data.GyroX - hmpu->runtimeGyroBiasX) * ((float)M_PI / 180.0f);
+    gy = (hmpu->Data.GyroY - hmpu->runtimeGyroBiasY) * ((float)M_PI / 180.0f);
+    gz = (hmpu->Data.GyroZ - hmpu->runtimeGyroBiasZ) * ((float)M_PI / 180.0f);
+  }
+
+  if ((accelNormSq > 0.0f) &&
+      (accelNorm >= MPU6050_ACCEL_GATE_MIN_G) &&
+      (accelNorm <= MPU6050_ACCEL_GATE_MAX_G) &&
+      (accelWeight > 0.0f))
+  {
+    recipNorm = MPU6050_InvSqrt(accelNormSq);
     ax *= recipNorm;
     ay *= recipNorm;
     az *= recipNorm;
@@ -214,8 +294,11 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
     halfex = (ay * halfvz) - (az * halfvy);
     halfey = (az * halfvx) - (ax * halfvz);
     halfez = (ax * halfvy) - (ay * halfvx);
+    halfex *= accelWeight;
+    halfey *= accelWeight;
+    halfez *= accelWeight;
 
-    if (hmpu->twoKi > 0.0f)
+    if ((hmpu->twoKi > 0.0f) && (accelWeight >= 0.2f))
     {
       hmpu->integralFBx += hmpu->twoKi * halfex * hmpu->dt;
       hmpu->integralFBy += hmpu->twoKi * halfey * hmpu->dt;
@@ -319,16 +402,176 @@ static void MPU6050_MahonyInit(MPU6050_Handle_t *hmpu)
   hmpu->q1 = 0.0f;
   hmpu->q2 = 0.0f;
   hmpu->q3 = 0.0f;
-  hmpu->twoKp = 2.0f * 0.5f;
-  hmpu->twoKi = 2.0f * 0.05f;
+  hmpu->nominalTwoKp = MPU6050_NOMINAL_TWO_KP;
+  hmpu->nominalTwoKi = MPU6050_NOMINAL_TWO_KI;
+  hmpu->twoKp = hmpu->nominalTwoKp;
+  hmpu->twoKi = hmpu->nominalTwoKi;
   hmpu->integralFBx = 0.0f;
   hmpu->integralFBy = 0.0f;
   hmpu->integralFBz = 0.0f;
   hmpu->dt = 0.0f;
   hmpu->lastTime = HAL_GetTick();
+  hmpu->startupBoostUntil = 0U;
+  hmpu->runtimeGyroBiasX = 0.0f;
+  hmpu->runtimeGyroBiasY = 0.0f;
+  hmpu->runtimeGyroBiasZ = 0.0f;
   hmpu->Attitude.Roll = 0.0f;
   hmpu->Attitude.Pitch = 0.0f;
   hmpu->Attitude.Timestamp = 0;
+}
+
+static MPU6050_Status_t MPU6050_InitAttitudeFromAccel(MPU6050_Handle_t *hmpu)
+{
+  float ax_sum = 0.0f;
+  float ay_sum = 0.0f;
+  float az_sum = 0.0f;
+  int32_t gx_sum = 0;
+  int32_t gy_sum = 0;
+  int32_t gz_sum = 0;
+  float ax;
+  float ay;
+  float az;
+  float norm;
+  float roll_rad;
+  float pitch_rad;
+  float gyro_mag;
+  uint16_t valid_count = 0;
+  uint16_t sample_count = 0;
+
+  for (uint16_t i = 0; i < MPU6050_ALIGN_DISCARD_COUNT; i++)
+  {
+    if (MPU6050_ReadRawData(hmpu) != MPU6050_OK)
+    {
+      return MPU6050_ERROR_I2C;
+    }
+    HAL_Delay(MPU6050_ALIGN_SAMPLE_DELAY_MS);
+  }
+
+  for (uint16_t attempt = 0; attempt < MPU6050_ALIGN_MAX_ATTEMPTS; attempt++)
+  {
+    if (MPU6050_ReadRawData(hmpu) != MPU6050_OK)
+    {
+      return MPU6050_ERROR_I2C;
+    }
+
+    norm = sqrtf((hmpu->Data.AccelX * hmpu->Data.AccelX) +
+                 (hmpu->Data.AccelY * hmpu->Data.AccelY) +
+                 (hmpu->Data.AccelZ * hmpu->Data.AccelZ));
+    gyro_mag = sqrtf((hmpu->Data.GyroX * hmpu->Data.GyroX) +
+                     (hmpu->Data.GyroY * hmpu->Data.GyroY) +
+                     (hmpu->Data.GyroZ * hmpu->Data.GyroZ));
+
+    if ((fabsf(norm - 1.0f) <= MPU6050_ALIGN_ACCEL_TOLERANCE_G) &&
+        (gyro_mag <= MPU6050_ALIGN_GYRO_TOLERANCE_DPS))
+    {
+      ax_sum += hmpu->Data.AccelX;
+      ay_sum += hmpu->Data.AccelY;
+      az_sum += hmpu->Data.AccelZ;
+      gx_sum += hmpu->RawData.GyroX;
+      gy_sum += hmpu->RawData.GyroY;
+      gz_sum += hmpu->RawData.GyroZ;
+      valid_count++;
+
+      if (valid_count >= MPU6050_ALIGN_SAMPLE_COUNT)
+      {
+        break;
+      }
+    }
+    else
+    {
+      ax_sum = 0.0f;
+      ay_sum = 0.0f;
+      az_sum = 0.0f;
+      gx_sum = 0;
+      gy_sum = 0;
+      gz_sum = 0;
+      valid_count = 0;
+    }
+
+    HAL_Delay(MPU6050_ALIGN_SAMPLE_DELAY_MS);
+  }
+
+  if (valid_count >= MPU6050_ALIGN_MIN_VALID_SAMPLES)
+  {
+    sample_count = valid_count;
+  }
+  else
+  {
+    ax_sum = 0.0f;
+    ay_sum = 0.0f;
+    az_sum = 0.0f;
+    gx_sum = 0;
+    gy_sum = 0;
+    gz_sum = 0;
+
+    for (uint16_t i = 0; i < MPU6050_FALLBACK_SAMPLE_COUNT; i++)
+    {
+      if (MPU6050_ReadRawData(hmpu) != MPU6050_OK)
+      {
+        return MPU6050_ERROR_I2C;
+      }
+
+      ax_sum += hmpu->Data.AccelX;
+      ay_sum += hmpu->Data.AccelY;
+      az_sum += hmpu->Data.AccelZ;
+      gx_sum += hmpu->RawData.GyroX;
+      gy_sum += hmpu->RawData.GyroY;
+      gz_sum += hmpu->RawData.GyroZ;
+      HAL_Delay(MPU6050_ALIGN_SAMPLE_DELAY_MS);
+    }
+
+    sample_count = MPU6050_FALLBACK_SAMPLE_COUNT;
+  }
+
+  ax = ax_sum / (float)sample_count;
+  ay = ay_sum / (float)sample_count;
+  az = az_sum / (float)sample_count;
+
+  norm = sqrtf((ax * ax) + (ay * ay) + (az * az));
+  if (norm <= 0.0f)
+  {
+    return MPU6050_ERROR_PARAM;
+  }
+
+  ax /= norm;
+  ay /= norm;
+  az /= norm;
+
+  roll_rad = atan2f(ay, az);
+  pitch_rad = atan2f(-ax, sqrtf((ay * ay) + (az * az)));
+
+  MPU6050_SetQuaternionFromRollPitch(hmpu, roll_rad, pitch_rad);
+
+  hmpu->Attitude.Roll = roll_rad * (180.0f / (float)M_PI);
+  hmpu->Attitude.Pitch = pitch_rad * (180.0f / (float)M_PI);
+  hmpu->Attitude.Timestamp = HAL_GetTick();
+  hmpu->Calibration.GyroOffsetX = (int16_t)(gx_sum / (int32_t)sample_count);
+  hmpu->Calibration.GyroOffsetY = (int16_t)(gy_sum / (int32_t)sample_count);
+  hmpu->Calibration.GyroOffsetZ = (int16_t)(gz_sum / (int32_t)sample_count);
+  hmpu->integralFBx = 0.0f;
+  hmpu->integralFBy = 0.0f;
+  hmpu->integralFBz = 0.0f;
+  hmpu->lastTime = HAL_GetTick();
+  hmpu->twoKp = MPU6050_BOOST_TWO_KP;
+  hmpu->twoKi = MPU6050_BOOST_TWO_KI;
+  hmpu->startupBoostUntil = hmpu->lastTime + MPU6050_STARTUP_BOOST_MS;
+
+  return MPU6050_OK;
+}
+
+static void MPU6050_SetQuaternionFromRollPitch(MPU6050_Handle_t *hmpu, float roll_rad, float pitch_rad)
+{
+  const float half_roll = 0.5f * roll_rad;
+  const float half_pitch = 0.5f * pitch_rad;
+  const float cr = cosf(half_roll);
+  const float sr = sinf(half_roll);
+  const float cp = cosf(half_pitch);
+  const float sp = sinf(half_pitch);
+
+  hmpu->q0 = cr * cp;
+  hmpu->q1 = sr * cp;
+  hmpu->q2 = cr * sp;
+  hmpu->q3 = -sr * sp;
 }
 
 static float MPU6050_InvSqrt(float x)

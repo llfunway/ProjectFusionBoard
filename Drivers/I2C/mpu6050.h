@@ -143,6 +143,12 @@ typedef struct
   float integralFBz;
   float dt;
   uint32_t lastTime;
+  float nominalTwoKp;
+  float nominalTwoKi;
+  uint32_t startupBoostUntil;
+  float runtimeGyroBiasX;
+  float runtimeGyroBiasY;
+  float runtimeGyroBiasZ;
 } MPU6050_Handle_t;
 
 /* Exported Functions --------------------------------------------------------*/

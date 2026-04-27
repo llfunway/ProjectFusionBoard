@@ -41,9 +41,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SYSTEM_FREQUENCY_HZ     ((uint32_t)50)   /* Keep <= configured AD7177 ODR (currently 59 SPS). */
-#define SENSOR_READ_PERIOD_MS   ((uint32_t)(1000U / SYSTEM_FREQUENCY_HZ))
-#define TEST_REPORT_PERIOD_MS   SENSOR_READ_PERIOD_MS
+#define ADC_FREQUENCY_HZ        ((uint32_t)50)   /* Keep <= configured AD7177 ODR (currently 59 SPS). */
+#define IMU_FREQUENCY_HZ        ((uint32_t)200)  /* Faster attitude update than ADC loop. */
+#define ADC_READ_PERIOD_MS      ((uint32_t)(1000U / ADC_FREQUENCY_HZ))
+#define IMU_READ_PERIOD_MS      ((uint32_t)(1000U / IMU_FREQUENCY_HZ))
+#define TEST_REPORT_PERIOD_MS   ADC_READ_PERIOD_MS
 #define AD7177_DEVICE_COUNT     ((uint8_t)3)
 
 #define AD7177_CS1_PORT         GPIOC
@@ -53,8 +55,12 @@
 #define AD7177_CS3_PORT         GPIOB
 #define AD7177_CS3_PIN          GPIO_PIN_5
 
+#define ERR_MPU6050_INIT        ((uint8_t)1)
 #define ERR_SPI_ADC_INIT        ((uint8_t)2)
 #define ERR_UART_INIT           ((uint8_t)3)
+#define MPU6050_STARTUP_DELAY_MS ((uint32_t)100)
+#define MPU6050_INIT_RETRY_COUNT ((uint8_t)5)
+#define MPU6050_INIT_RETRY_DELAY_MS ((uint32_t)20)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -72,13 +78,24 @@ volatile uint32_t g_SystemTick = 0;
 static volatile uint8_t g_ErrorCode = 0;
 volatile uint8_t g_IsInitialized = 0;
 
+static MPU6050_Handle_t hMPU6050;
 static AD7177_Handle_t hAD7177[AD7177_DEVICE_COUNT];
 UART_Proto_Handle_t hUART_Proto;
 
 static uint32_t lastSensorRead = 0;
 static uint32_t lastTestReport = 0;
+static uint32_t lastImuRead = 0;
 
 static float adc_voltage[AD7177_DEVICE_COUNT] = {0.0f};
+static float imu_roll = 0.0f;
+static float imu_pitch = 0.0f;
+static float imu_temperature = 0.0f;
+static float vertical_proj = 0.0f;
+static int8_t mpu_init_status = MPU6050_OK;
+static uint8_t mpu_init_address = 0;
+static uint8_t mpu_init_device_id = 0;
+static int8_t mpu_probe_status[2] = {MPU6050_ERROR, MPU6050_ERROR};
+static uint8_t mpu_probe_device_id[2] = {0, 0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -97,6 +114,9 @@ static void Process_Test_Report(void);
 static void Handle_Init_Error(uint8_t error_code);
 static void System_Status_Update(void);
 static void UART_SendString(const char *str);
+static void UART_SendMpuInitDebug(void);
+static void UART_SendI2CBusScan(void);
+static void UART_SendDataHeader(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -115,11 +135,66 @@ static void UART_SendFrequencyInfo(void)
   int len = snprintf(txBuf,
                      sizeof(txBuf),
                      "frequency=%luHz\r\n",
-                     (unsigned long)SYSTEM_FREQUENCY_HZ);
+                     (unsigned long)ADC_FREQUENCY_HZ);
 
   if (len > 0)
   {
     HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
+  }
+}
+
+static void UART_SendDataHeader(void)
+{
+  UART_SendString("adc1\tadc2\tadc3\troll\tpitch\tvertical_proj\r\n");
+}
+
+static void UART_SendMpuInitDebug(void)
+{
+  char txBuf[128];
+  int len = snprintf(txBuf,
+                     sizeof(txBuf),
+                     "MPU_INIT status=%d addr=0x%02X whoami=0x%02X probe[D0]=%d/0x%02X probe[D2]=%d/0x%02X\r\n",
+                     (int)mpu_init_status,
+                     mpu_init_address,
+                     mpu_init_device_id,
+                     (int)mpu_probe_status[0],
+                     mpu_probe_device_id[0],
+                     (int)mpu_probe_status[1],
+                     mpu_probe_device_id[1]);
+
+  if (len > 0)
+  {
+    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
+  }
+}
+
+static void UART_SendI2CBusScan(void)
+{
+  char txBuf[160];
+  int len = snprintf(txBuf, sizeof(txBuf), "I2C_SCAN:");
+  uint8_t found = 0;
+
+  for (uint8_t address = 0x08; address < 0x78; address++)
+  {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(address << 1), 2, 20) == HAL_OK)
+    {
+      if (len > 0 && len < (int)(sizeof(txBuf) - 8))
+      {
+        len += snprintf(&txBuf[len], sizeof(txBuf) - (size_t)len, " 0x%02X", address);
+        found = 1;
+      }
+    }
+  }
+
+  if (!found && len > 0 && len < (int)(sizeof(txBuf) - 5))
+  {
+    len += snprintf(&txBuf[len], sizeof(txBuf) - (size_t)len, " none");
+  }
+
+  if (len > 0 && len < (int)(sizeof(txBuf) - 3))
+  {
+    len += snprintf(&txBuf[len], sizeof(txBuf) - (size_t)len, "\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 200);
   }
 }
 /* USER CODE END 0 */
@@ -139,6 +214,7 @@ int main(void)
   MX_USART1_UART_Init();
 
   Init_System_Tick();
+  UART_SendString("BOOT\r\n");
 
   if (Init_All_Drivers() != 0)
   {
@@ -148,13 +224,32 @@ int main(void)
     }
   }
 
+  imu_roll = hMPU6050.Attitude.Roll;
+  imu_pitch = hMPU6050.Attitude.Pitch;
+  imu_temperature = hMPU6050.Data.Temp;
+  Process_Sensor_Data();
+
   g_IsInitialized = 1;
   UART_SendFrequencyInfo();
   UART_SendString("3xAD7177 test start\r\n");
+  UART_SendDataHeader();
 
   while (1)
   {
-    if ((g_SystemTick - lastSensorRead) >= SENSOR_READ_PERIOD_MS)
+    if ((g_SystemTick - lastImuRead) >= IMU_READ_PERIOD_MS)
+    {
+      lastImuRead = g_SystemTick;
+
+      if ((MPU6050_ReadRawData(&hMPU6050) == MPU6050_OK) &&
+          (MPU6050_UpdateAttitude(&hMPU6050) == MPU6050_OK))
+      {
+        imu_roll = hMPU6050.Attitude.Roll;
+        imu_pitch = hMPU6050.Attitude.Pitch;
+        imu_temperature = hMPU6050.Data.Temp;
+      }
+    }
+
+    if ((g_SystemTick - lastSensorRead) >= ADC_READ_PERIOD_MS)
     {
       lastSensorRead = g_SystemTick;
 
@@ -190,6 +285,19 @@ static void Init_System_Tick(void)
 
 static uint8_t Init_All_Drivers(void)
 {
+  MPU6050_Config_t mpu_config = {
+    .hi2c = &hi2c1,
+    .I2cAddress = 0,
+    .AccelRange = MPU6050_ACCEL_RANGE_2G,
+    .GyroRange = MPU6050_GYRO_RANGE_500DPS,
+    .DlpfBandwidth = MPU6050_DLPF_BW_42HZ,
+    .SampleRateDiv = 4,
+    .Timeout = 100
+  };
+  const uint8_t mpu_probe_addresses[] = {
+    (uint8_t)(MPU6050_ADDR_AD0_LOW << 1),
+    (uint8_t)(MPU6050_ADDR_AD0_HIGH << 1)
+  };
   AD7177_Config_t adc_config = {
     .hspi = &hspi1,
     .CsPort = AD7177_CS1_PORT,
@@ -206,7 +314,46 @@ static uint8_t Init_All_Drivers(void)
     return g_ErrorCode;
   }
 
-  /* MPU6050 initialization is temporarily disabled during 3-channel AD7177 bring-up. */
+  mpu_init_status = MPU6050_ERROR;
+  mpu_init_address = 0;
+  mpu_init_device_id = 0;
+  mpu_probe_status[0] = MPU6050_ERROR;
+  mpu_probe_status[1] = MPU6050_ERROR;
+  mpu_probe_device_id[0] = 0;
+  mpu_probe_device_id[1] = 0;
+
+  HAL_Delay(MPU6050_STARTUP_DELAY_MS);
+
+  for (uint8_t i = 0; i < (sizeof(mpu_probe_addresses) / sizeof(mpu_probe_addresses[0])); i++)
+  {
+    for (uint8_t retry = 0; retry < MPU6050_INIT_RETRY_COUNT; retry++)
+    {
+      mpu_config.I2cAddress = mpu_probe_addresses[i];
+      mpu_init_address = mpu_probe_addresses[i];
+      mpu_init_status = MPU6050_Init(&hMPU6050, &mpu_config);
+      mpu_init_device_id = hMPU6050.DeviceID;
+      mpu_probe_status[i] = mpu_init_status;
+      mpu_probe_device_id[i] = hMPU6050.DeviceID;
+
+      if (mpu_init_status == MPU6050_OK)
+      {
+        break;
+      }
+
+      HAL_Delay(MPU6050_INIT_RETRY_DELAY_MS);
+    }
+
+    if (mpu_init_status == MPU6050_OK)
+    {
+      break;
+    }
+  }
+
+  if (mpu_init_status != MPU6050_OK)
+  {
+    g_ErrorCode = ERR_MPU6050_INIT;
+    return g_ErrorCode;
+  }
 
   adc_config.Channels[0].Channel = 0;
   adc_config.Channels[0].AinPos = 3;
@@ -247,19 +394,30 @@ static uint8_t Init_All_Drivers(void)
 
 static void Process_Sensor_Data(void)
 {
-  /* Reserved for future threshold/event logic during bring-up. */
+  const float roll_rad = imu_roll * ((float)M_PI / 180.0f);
+  const float pitch_rad = imu_pitch * ((float)M_PI / 180.0f);
+  const float ez_x = -sinf(pitch_rad);
+  const float ez_y = sinf(roll_rad) * cosf(pitch_rad);
+  const float ez_z = cosf(roll_rad) * cosf(pitch_rad);
+
+  vertical_proj = (adc_voltage[0] * ez_x) +
+                  (adc_voltage[1] * ez_y) +
+                  (adc_voltage[2] * ez_z);
 }
 
 static void Process_Test_Report(void)
 {
-  char txBuf[128];
+  char txBuf[160];
   int len = snprintf(
       txBuf,
       sizeof(txBuf),
-      "{plotter}%.6f,%.6f,%.6f\r\n",
+      "%.6f\t%.6f\t%.6f\t%.3f\t%.3f\t%.6f\r\n",
       adc_voltage[0],
       adc_voltage[1],
-      adc_voltage[2]);
+      adc_voltage[2],
+      imu_roll,
+      imu_pitch,
+      vertical_proj);
 
   if (len > 0)
   {
@@ -277,11 +435,18 @@ static void Handle_Init_Error(uint8_t error_code)
     HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
   }
 
+  if (error_code == ERR_MPU6050_INIT)
+  {
+    UART_SendMpuInitDebug();
+    UART_SendI2CBusScan();
+  }
+
   HAL_Delay(500);
 }
 
 static void System_Status_Update(void)
 {
+  (void)imu_temperature;
   /* Keep hook for future board-level status management. */
 }
 /* USER CODE END 4 */
