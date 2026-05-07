@@ -19,7 +19,7 @@
 #define ACCEL_SENSITIVITY_8G          (4096.0f)
 #define ACCEL_SENSITIVITY_16G         (2048.0f)
 
-#define GYRO_SENSITIVITY_250DPS       (131.0f)
+#define GYRO_SENSITIVITY_250DPS        (131.0f)
 #define GYRO_SENSITIVITY_500DPS       (65.5f)
 #define GYRO_SENSITIVITY_1000DPS      (32.8f)
 #define GYRO_SENSITIVITY_2000DPS      (16.4f)

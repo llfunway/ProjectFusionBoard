@@ -396,6 +396,11 @@
               <FilePath>../Core/Src/main.c</FilePath>
             </File>
             <File>
+              <FileName>mag_residual_filter.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/mag_residual_filter.c</FilePath>
+            </File>
+            <File>
               <FileName>stm32f1xx_it.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_it.c</FilePath>

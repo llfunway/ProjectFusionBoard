@@ -32,6 +32,7 @@
 #include "i2c_hal_wrapper.h"
 #include "mpu6050.h"
 #include "ad7177.h"
+#include "mag_residual_filter.h"
 #include "uart_proto.h"
 /* USER CODE END Includes */
 
@@ -95,7 +96,9 @@ static float mag_nt[AD7177_DEVICE_COUNT] = {0.0f};
 static float imu_roll = 0.0f;
 static float imu_pitch = 0.0f;
 static float imu_temperature = 0.0f;
+static float vertical_proj_raw = 0.0f;
 static float vertical_proj = 0.0f;
+static MagResidualFilter_t mag_residual_filter;
 static int8_t mpu_init_status = MPU6050_OK;
 static uint8_t mpu_init_address = 0;
 static uint8_t mpu_init_device_id = 0;
@@ -150,7 +153,7 @@ static void UART_SendFrequencyInfo(void)
 
 static void UART_SendDataHeader(void)
 {
-  UART_SendString("b1_nT\tb2_nT\tb3_nT\troll\tpitch\tvertical_proj_nT\r\n");
+  UART_SendString("b1_nT\tb2_nT\tb3_nT\troll\tpitch\tvertical_raw_nT\tvertical_corr_nT\r\n");
 }
 
 static void UART_SendMpuInitDebug(void)
@@ -232,6 +235,7 @@ int main(void)
   imu_roll = hMPU6050.Attitude.Roll;
   imu_pitch = hMPU6050.Attitude.Pitch;
   imu_temperature = hMPU6050.Data.Temp;
+  MagResidualFilter_Init(&mag_residual_filter);
   Process_Sensor_Data();
 
   g_IsInitialized = 1;
@@ -401,33 +405,43 @@ static void Process_Sensor_Data(void)
 {
   const float roll_rad = imu_roll * ((float)M_PI / 180.0f);
   const float pitch_rad = imu_pitch * ((float)M_PI / 180.0f);
-  const float ez_x = -sinf(pitch_rad);
-  const float ez_y = sinf(roll_rad) * cosf(pitch_rad);
-  const float ez_z = cosf(roll_rad) * cosf(pitch_rad);
+  const float vertical_unit[3] = {
+    -sinf(pitch_rad),
+    sinf(roll_rad) * cosf(pitch_rad),
+    cosf(roll_rad) * cosf(pitch_rad)
+  };
 
   for (uint8_t i = 0; i < AD7177_DEVICE_COUNT; i++)
   {
     mag_nt[i] = adc_voltage[i] * MAG_ADC_V_TO_NT;
   }
 
-  vertical_proj = (mag_nt[0] * ez_x) +
-                  (mag_nt[1] * ez_y) +
-                  (mag_nt[2] * ez_z);
+  vertical_proj_raw = (mag_nt[0] * vertical_unit[0]) +
+                      (mag_nt[1] * vertical_unit[1]) +
+                      (mag_nt[2] * vertical_unit[2]);
+
+  vertical_proj = MagResidualFilter_Update(&mag_residual_filter,
+                                           mag_nt,
+                                           vertical_unit,
+                                           vertical_proj_raw);
 }
 
 static void Process_Test_Report(void)
 {
-  char txBuf[160];
+  char txBuf[240];
   int len = snprintf(
       txBuf,
       sizeof(txBuf),
-      "%.6f\t%.6f\t%.6f\t%.3f\t%.3f\t%.6f\r\n",
+      "%.6f\t%.6f\t%.6f\t%.3f\t%.3f\t%.6f\t%.6f\t%.6f\t%.6f\r\n",
       mag_nt[0],
       mag_nt[1],
       mag_nt[2],
       imu_roll,
       imu_pitch,
-      vertical_proj);
+      vertical_proj_raw,
+      vertical_proj,
+      mag_residual_filter.residual_nT,
+      mag_residual_filter.correction_nT);
 
   if (len > 0)
   {
