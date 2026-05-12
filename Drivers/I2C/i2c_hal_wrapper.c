@@ -248,16 +248,65 @@ int8_t I2C_CheckDevice(I2C_Device_TypeDef *hi2c_dev)
   return I2C_OK;
 }
 
+/* Public Functions — Bus Recovery -------------------------------------------*/
+
+/**
+  * @brief  Recover I2C bus from stuck-BUSY condition (STM32F1 errata).
+  *         Toggles SCL to flush any held slave state, then resets the peripheral.
+  * @param  hi2c_dev: Pointer to I2C device structure
+  * @param  sclPort: GPIO port for SCL pin
+  * @param  sclPin:  GPIO pin for SCL
+  * @retval I2C_OK on success, error code otherwise
+  */
+int8_t I2C_BusRecovery(I2C_Device_TypeDef *hi2c_dev, GPIO_TypeDef *sclPort, uint16_t sclPin)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  if (hi2c_dev == NULL || hi2c_dev->hi2c == NULL || sclPort == NULL)
+  {
+    return I2C_ERROR_PARAM;
+  }
+
+  /* Disable the I2C peripheral */
+  hi2c_dev->hi2c->Instance->CR1 &= ~I2C_CR1_PE;
+  HAL_Delay(2);
+
+  /* Configure SCL as open-drain output and toggle it to flush stuck slaves */
+  GPIO_InitStruct.Pin = sclPin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(sclPort, &GPIO_InitStruct);
+
+  for (uint8_t i = 0; i < 16; i++)
+  {
+    HAL_GPIO_WritePin(sclPort, sclPin, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(sclPort, sclPin, GPIO_PIN_SET);
+    HAL_Delay(1);
+  }
+
+  /* Re-enable the I2C peripheral — the application must re-init via HAL afterwards */
+  hi2c_dev->hi2c->Instance->CR1 |= I2C_CR1_PE;
+  HAL_Delay(2);
+
+  /* Restore SCL to its alternate-function role */
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  HAL_GPIO_Init(sclPort, &GPIO_InitStruct);
+
+  return I2C_OK;
+}
+
 /* Private Functions ---------------------------------------------------------*/
 
 /**
   * @brief  Wait for I2C flag with timeout
   */
-static uint8_t I2C_WaitForFlag(I2C_HandleTypeDef *hi2c, uint32_t Flag, 
+static uint8_t I2C_WaitForFlag(I2C_HandleTypeDef *hi2c, uint32_t Flag,
                                 FlagStatus Status, uint32_t Timeout)
 {
   uint32_t tickstart = HAL_GetTick();
-  
+
   while ((__HAL_I2C_GET_FLAG(hi2c, Flag) ? SET : RESET) != Status)
   {
     if (Timeout != HAL_MAX_DELAY)
@@ -268,6 +317,6 @@ static uint8_t I2C_WaitForFlag(I2C_HandleTypeDef *hi2c, uint32_t Flag,
       }
     }
   }
-  
+
   return 1; /* Success */
 }

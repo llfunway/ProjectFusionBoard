@@ -192,6 +192,12 @@ MPU6050_Status_t MPU6050_ReadRawData(MPU6050_Handle_t *hmpu)
   hmpu->Data.GyroY = (float)hmpu->RawData.GyroY / gyroScale;
   hmpu->Data.GyroZ = (float)hmpu->RawData.GyroZ / gyroScale;
 
+  if (isnan(hmpu->Data.AccelX) || isnan(hmpu->Data.AccelY) || isnan(hmpu->Data.AccelZ) ||
+      isnan(hmpu->Data.GyroX) || isnan(hmpu->Data.GyroY) || isnan(hmpu->Data.GyroZ))
+  {
+    return MPU6050_ERROR_I2C;
+  }
+
   return MPU6050_OK;
 }
 
@@ -226,6 +232,25 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
     return MPU6050_ERROR_NOT_INIT;
   }
 
+  /* Detect and recover from NaN/Inf in quaternion (e.g. from bad sensor data).
+   * Reset to identity quaternion so attitude can converge again from accelerometer. */
+  if (isnan(hmpu->q0) || isinf(hmpu->q0) ||
+      isnan(hmpu->q1) || isinf(hmpu->q1) ||
+      isnan(hmpu->q2) || isinf(hmpu->q2) ||
+      isnan(hmpu->q3) || isinf(hmpu->q3))
+  {
+    hmpu->q0 = 1.0f;
+    hmpu->q1 = 0.0f;
+    hmpu->q2 = 0.0f;
+    hmpu->q3 = 0.0f;
+    hmpu->integralFBx = 0.0f;
+    hmpu->integralFBy = 0.0f;
+    hmpu->integralFBz = 0.0f;
+    hmpu->twoKp = hmpu->nominalTwoKp;
+    hmpu->twoKi = hmpu->nominalTwoKi;
+    hmpu->startupBoostUntil = 0U;
+  }
+
   currentTime = HAL_GetTick();
   if ((hmpu->startupBoostUntil != 0U) && ((int32_t)(currentTime - hmpu->startupBoostUntil) >= 0))
   {
@@ -248,6 +273,14 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
   gx = (hmpu->Data.GyroX - hmpu->runtimeGyroBiasX) * ((float)M_PI / 180.0f);
   gy = (hmpu->Data.GyroY - hmpu->runtimeGyroBiasY) * ((float)M_PI / 180.0f);
   gz = (hmpu->Data.GyroZ - hmpu->runtimeGyroBiasZ) * ((float)M_PI / 180.0f);
+
+  /* Guard against NaN/Inf from corrupted I2C reads */
+  if (isnan(ax) || isinf(ax)) ax = 0.0f;
+  if (isnan(ay) || isinf(ay)) ay = 0.0f;
+  if (isnan(az) || isinf(az)) az = 1.0f;
+  if (isnan(gx) || isinf(gx)) gx = 0.0f;
+  if (isnan(gy) || isinf(gy)) gy = 0.0f;
+  if (isnan(gz) || isinf(gz)) gz = 0.0f;
 
   accelNormSq = (ax * ax) + (ay * ay) + (az * az);
   accelNorm = sqrtf(accelNormSq);

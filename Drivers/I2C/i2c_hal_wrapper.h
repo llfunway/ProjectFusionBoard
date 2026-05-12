@@ -149,6 +149,8 @@ int8_t I2C_WriteBit(I2C_Device_TypeDef *hi2c_dev,
   */
 int8_t I2C_CheckDevice(I2C_Device_TypeDef *hi2c_dev);
 
+int8_t I2C_BusRecovery(I2C_Device_TypeDef *hi2c_dev, GPIO_TypeDef *sclPort, uint16_t sclPin);
+
 #ifdef __cplusplus
 }
 #endif

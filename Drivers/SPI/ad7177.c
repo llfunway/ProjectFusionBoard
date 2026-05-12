@@ -46,7 +46,10 @@ AD7177_Status_t AD7177_Init(AD7177_Handle_t *had7177, AD7177_Config_t *pConfig)
   
   /* Initialize CS pin */
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_GPIOA_CLK_ENABLE();
+  if (had7177->Config.CsPort == GPIOA) { __HAL_RCC_GPIOA_CLK_ENABLE(); }
+  else if (had7177->Config.CsPort == GPIOB) { __HAL_RCC_GPIOB_CLK_ENABLE(); }
+  else if (had7177->Config.CsPort == GPIOC) { __HAL_RCC_GPIOC_CLK_ENABLE(); }
+  else if (had7177->Config.CsPort == GPIOD) { __HAL_RCC_GPIOD_CLK_ENABLE(); }
   
   GPIO_InitStruct.Pin = had7177->Config.CsPin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -65,7 +68,7 @@ AD7177_Status_t AD7177_Init(AD7177_Handle_t *had7177, AD7177_Config_t *pConfig)
 
   HAL_Delay(10);
 
-  /* Allow register access during the remainder of initialization. */
+  /* Allow register access during init. Cleared on failure below. */
   had7177->IsInitialized = 1;
   
   /* Read Device ID */

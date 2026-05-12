@@ -49,9 +49,7 @@
 #define TEST_REPORT_PERIOD_MS   ADC_READ_PERIOD_MS
 #define AD7177_DEVICE_COUNT     ((uint8_t)3)
 #define MAG_FRONTEND_SCALE      ((float)4.0f)
-#define MAG_SENSOR_V_PER_GS     ((float)10.0f)
-#define MAG_NT_PER_GS           ((float)100000.0f)
-#define MAG_ADC_V_TO_NT         ((MAG_FRONTEND_SCALE / MAG_SENSOR_V_PER_GS) * MAG_NT_PER_GS)
+#define MAG_NT_PER_OE           ((float)100000.0f)
 
 #define AD7177_CS1_PORT         GPIOC
 #define AD7177_CS1_PIN          GPIO_PIN_12
@@ -82,6 +80,11 @@ UART_HandleTypeDef huart1;
 volatile uint32_t g_SystemTick = 0;
 static volatile uint8_t g_ErrorCode = 0;
 volatile uint8_t g_IsInitialized = 0;
+volatile uint8_t g_UartReady = 0;
+static volatile uint8_t g_SensorDataFresh = 0;
+static volatile uint8_t g_ImuDataFresh = 0;
+static volatile uint32_t g_ImuConsecutiveErrors = 0;
+static volatile uint32_t g_AdcConsecutiveTimeouts = 0;
 
 static MPU6050_Handle_t hMPU6050;
 static AD7177_Handle_t hAD7177[AD7177_DEVICE_COUNT];
@@ -99,6 +102,16 @@ static float imu_temperature = 0.0f;
 static float vertical_proj_raw = 0.0f;
 static float vertical_proj = 0.0f;
 static MagResidualFilter_t mag_residual_filter;
+static const float mag_sensitivity_v_per_oe[AD7177_DEVICE_COUNT] = {
+  10.3904f,
+  10.5235f,
+  10.9590f
+};
+static const float mag_zero_offset_v[AD7177_DEVICE_COUNT] = {
+  -0.1350f,
+  -0.1949f,
+  -0.1795f
+};
 static int8_t mpu_init_status = MPU6050_OK;
 static uint8_t mpu_init_address = 0;
 static uint8_t mpu_init_device_id = 0;
@@ -120,8 +133,8 @@ static uint8_t Init_All_Drivers(void);
 static void Process_Sensor_Data(void);
 static void Process_Test_Report(void);
 static void Handle_Init_Error(uint8_t error_code);
-static void System_Status_Update(void);
 static void UART_SendString(const char *str);
+static void UART_SendFormattedBuffer(const char *buf, size_t buf_size, int len, uint32_t timeout);
 static void UART_SendMpuInitDebug(void);
 static void UART_SendI2CBusScan(void);
 static void UART_SendDataHeader(void);
@@ -137,6 +150,14 @@ static void UART_SendString(const char *str)
   }
 }
 
+static void UART_SendFormattedBuffer(const char *buf, size_t buf_size, int len, uint32_t timeout)
+{
+  if ((buf != NULL) && (len > 0) && ((size_t)len < buf_size))
+  {
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)len, timeout);
+  }
+}
+
 static void UART_SendFrequencyInfo(void)
 {
   char txBuf[48];
@@ -145,15 +166,12 @@ static void UART_SendFrequencyInfo(void)
                      "frequency=%luHz\r\n",
                      (unsigned long)ADC_FREQUENCY_HZ);
 
-  if (len > 0)
-  {
-    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
-  }
+  UART_SendFormattedBuffer(txBuf, sizeof(txBuf), len, 100);
 }
 
 static void UART_SendDataHeader(void)
 {
-  UART_SendString("b1_nT\tb2_nT\tb3_nT\troll\tpitch\tvertical_raw_nT\tvertical_corr_nT\r\n");
+  UART_SendString("{text}b1_nT,b2_nT,b3_nT,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,stm32_roll_deg,stm32_pitch_deg\r\n");
 }
 
 static void UART_SendMpuInitDebug(void)
@@ -170,10 +188,7 @@ static void UART_SendMpuInitDebug(void)
                      (int)mpu_probe_status[1],
                      mpu_probe_device_id[1]);
 
-  if (len > 0)
-  {
-    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
-  }
+  UART_SendFormattedBuffer(txBuf, sizeof(txBuf), len, 100);
 }
 
 static void UART_SendI2CBusScan(void)
@@ -202,7 +217,7 @@ static void UART_SendI2CBusScan(void)
   if (len > 0 && len < (int)(sizeof(txBuf) - 3))
   {
     len += snprintf(&txBuf[len], sizeof(txBuf) - (size_t)len, "\r\n");
-    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 200);
+    UART_SendFormattedBuffer(txBuf, sizeof(txBuf), len, 200);
   }
 }
 /* USER CODE END 0 */
@@ -220,6 +235,7 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
+  g_UartReady = 1;
 
   Init_System_Tick();
   UART_SendString("BOOT\r\n");
@@ -239,6 +255,7 @@ int main(void)
   Process_Sensor_Data();
 
   g_IsInitialized = 1;
+  (void)imu_temperature;
   UART_SendFrequencyInfo();
   UART_SendString("3xAD7177 test start\r\n");
   UART_SendDataHeader();
@@ -255,25 +272,52 @@ int main(void)
         imu_roll = hMPU6050.Attitude.Roll;
         imu_pitch = hMPU6050.Attitude.Pitch;
         imu_temperature = hMPU6050.Data.Temp;
+        g_ImuDataFresh = 1;
+        g_ImuConsecutiveErrors = 0;
+      }
+      else
+      {
+        g_ImuConsecutiveErrors++;
+        g_ImuDataFresh = 0;
       }
     }
 
     if ((g_SystemTick - lastSensorRead) >= ADC_READ_PERIOD_MS)
     {
-      lastSensorRead = g_SystemTick;
+      float adc_voltage_next[AD7177_DEVICE_COUNT];
+      uint8_t all_adc_fresh = 1;
 
-      /* MPU6050 test path is temporarily disabled during 3-channel AD7177 bring-up. */
+      lastSensorRead = g_SystemTick;
+      g_SensorDataFresh = 0;
 
       for (uint8_t i = 0; i < AD7177_DEVICE_COUNT; i++)
       {
-        if (AD7177_ReadData(&hAD7177[i], 0, &hAD7177[i].RawData[0]) == AD7177_OK)
+        if ((AD7177_ReadData(&hAD7177[i], 0, &hAD7177[i].RawData[0]) != AD7177_OK) ||
+            (AD7177_GetVoltage(&hAD7177[i], 0, &adc_voltage_next[i]) != AD7177_OK))
         {
-          AD7177_GetVoltage(&hAD7177[i], 0, &adc_voltage[i]);
+          all_adc_fresh = 0;
         }
+      }
+
+      if (all_adc_fresh)
+      {
+        for (uint8_t i = 0; i < AD7177_DEVICE_COUNT; i++)
+        {
+          adc_voltage[i] = adc_voltage_next[i];
+        }
+        g_SensorDataFresh = 1;
+        g_AdcConsecutiveTimeouts = 0;
+      }
+      else
+      {
+        g_AdcConsecutiveTimeouts++;
       }
     }
 
-    Process_Sensor_Data();
+    if (g_SensorDataFresh || g_ImuDataFresh)
+    {
+      Process_Sensor_Data();
+    }
 
     if ((g_SystemTick - lastTestReport) >= TEST_REPORT_PERIOD_MS)
     {
@@ -281,7 +325,6 @@ int main(void)
       Process_Test_Report();
     }
 
-    System_Status_Update();
     HAL_Delay(1);
   }
 }
@@ -403,8 +446,20 @@ static uint8_t Init_All_Drivers(void)
 
 static void Process_Sensor_Data(void)
 {
-  const float roll_rad = imu_roll * ((float)M_PI / 180.0f);
-  const float pitch_rad = imu_pitch * ((float)M_PI / 180.0f);
+  float roll_rad;
+  float pitch_rad;
+
+  if (isnan(imu_roll) || isinf(imu_roll) || isnan(imu_pitch) || isinf(imu_pitch))
+  {
+    roll_rad = 0.0f;
+    pitch_rad = 0.0f;
+  }
+  else
+  {
+    roll_rad = imu_roll * ((float)M_PI / 180.0f);
+    pitch_rad = imu_pitch * ((float)M_PI / 180.0f);
+  }
+
   const float vertical_unit[3] = {
     -sinf(pitch_rad),
     sinf(roll_rad) * cosf(pitch_rad),
@@ -413,12 +468,26 @@ static void Process_Sensor_Data(void)
 
   for (uint8_t i = 0; i < AD7177_DEVICE_COUNT; i++)
   {
-    mag_nt[i] = adc_voltage[i] * MAG_ADC_V_TO_NT;
+    float sensor_voltage;
+
+    if (isnan(adc_voltage[i]) || isinf(adc_voltage[i]))
+    {
+      adc_voltage[i] = 0.0f;
+    }
+
+    sensor_voltage = adc_voltage[i] * MAG_FRONTEND_SCALE;
+    mag_nt[i] = ((sensor_voltage - mag_zero_offset_v[i]) /
+                 mag_sensitivity_v_per_oe[i]) * MAG_NT_PER_OE;
   }
 
   vertical_proj_raw = (mag_nt[0] * vertical_unit[0]) +
                       (mag_nt[1] * vertical_unit[1]) +
                       (mag_nt[2] * vertical_unit[2]);
+
+  if (isnan(vertical_proj_raw) || isinf(vertical_proj_raw))
+  {
+    vertical_proj_raw = 0.0f;
+  }
 
   vertical_proj = MagResidualFilter_Update(&mag_residual_filter,
                                            mag_nt,
@@ -432,21 +501,20 @@ static void Process_Test_Report(void)
   int len = snprintf(
       txBuf,
       sizeof(txBuf),
-      "%.6f\t%.6f\t%.6f\t%.3f\t%.3f\t%.6f\t%.6f\t%.6f\t%.6f\r\n",
+      "{plotter}%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\r\n",
       mag_nt[0],
       mag_nt[1],
       mag_nt[2],
-      imu_roll,
-      imu_pitch,
-      vertical_proj_raw,
-      vertical_proj,
-      mag_residual_filter.residual_nT,
-      mag_residual_filter.correction_nT);
+      hMPU6050.Data.AccelX,
+      hMPU6050.Data.AccelY,
+      hMPU6050.Data.AccelZ,
+      hMPU6050.Data.GyroX,
+      hMPU6050.Data.GyroY,
+      hMPU6050.Data.GyroZ,
+      hMPU6050.Attitude.Roll,
+      hMPU6050.Attitude.Pitch);
 
-  if (len > 0)
-  {
-    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
-  }
+  UART_SendFormattedBuffer(txBuf, sizeof(txBuf), len, 100);
 }
 
 static void Handle_Init_Error(uint8_t error_code)
@@ -454,10 +522,7 @@ static void Handle_Init_Error(uint8_t error_code)
   char txBuf[48];
   int len = snprintf(txBuf, sizeof(txBuf), "INIT_ERROR:%u\r\n", error_code);
 
-  if (len > 0)
-  {
-    HAL_UART_Transmit(&huart1, (uint8_t *)txBuf, (uint16_t)len, 100);
-  }
+  UART_SendFormattedBuffer(txBuf, sizeof(txBuf), len, 100);
 
   if (error_code == ERR_MPU6050_INIT)
   {
@@ -468,11 +533,6 @@ static void Handle_Init_Error(uint8_t error_code)
   HAL_Delay(500);
 }
 
-static void System_Status_Update(void)
-{
-  (void)imu_temperature;
-  /* Keep hook for future board-level status management. */
-}
 /* USER CODE END 4 */
 
 /**
@@ -643,10 +703,12 @@ static void MX_USART1_UART_Init(void)
 void Error_Handler(void)
 {
   __disable_irq();
-  while (1)
+  if (g_UartReady)
   {
     UART_SendString("FATAL_ERROR\r\n");
-    HAL_Delay(200);
+  }
+  while (1)
+  {
   }
 }
 
