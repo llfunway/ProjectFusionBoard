@@ -63,8 +63,14 @@ void Error_Handler(void);
 #define RCC_OSC8_OUT_GPIO_Port GPIOD
 #define ADC_CS_Pin GPIO_PIN_4
 #define ADC_CS_GPIO_Port GPIOA
-#define SD_CS_Pin GPIO_PIN_12
-#define SD_CS_GPIO_Port GPIOB
+#define LED_RUN_Pin GPIO_PIN_12
+#define LED_RUN_GPIO_Port GPIOB
+#define LED_ADC_Pin GPIO_PIN_13
+#define LED_ADC_GPIO_Port GPIOB
+#define LED_IMU_Pin GPIO_PIN_14
+#define LED_IMU_GPIO_Port GPIOB
+#define LED_ERR_Pin GPIO_PIN_15
+#define LED_ERR_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
