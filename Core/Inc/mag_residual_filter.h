@@ -7,11 +7,15 @@ extern "C" {
 
 typedef struct
 {
-  float baseline_nT;
+  float trend_nT;
   float weights[3];
+  float rls_p[3][3];
+  float rate_state[2];
+  float rate_p[2][2];
   float corrected_nT;
   float correction_nT;
   float residual_nT;
+  float rate_nT_per_s;
   unsigned char initialized;
 } MagResidualFilter_t;
 

@@ -149,6 +149,7 @@ typedef struct
   float runtimeGyroBiasX;
   float runtimeGyroBiasY;
   float runtimeGyroBiasZ;
+  float accelNormRef;
 } MPU6050_Handle_t;
 
 /* Exported Functions --------------------------------------------------------*/

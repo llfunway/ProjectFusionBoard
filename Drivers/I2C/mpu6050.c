@@ -40,13 +40,18 @@
 #define MPU6050_ACCEL_ZERO_TRUST_DELTA_G  (0.20f)
 #define MPU6050_STARTUP_BOOST_MS          (800U)
 #define MPU6050_NOMINAL_TWO_KP            (1.0f)
-#define MPU6050_NOMINAL_TWO_KI            (0.1f)
+#define MPU6050_NOMINAL_TWO_KI            (0.02f)
 #define MPU6050_BOOST_TWO_KP              (6.0f)
 #define MPU6050_BOOST_TWO_KI              (0.0f)
 #define MPU6050_FALLBACK_SAMPLE_COUNT     (16U)
 #define MPU6050_STATIC_ACCEL_TOLERANCE_G  (0.05f)
-#define MPU6050_STATIC_GYRO_TOLERANCE_DPS (1.5f)
-#define MPU6050_GYRO_BIAS_ADAPT_ALPHA     (0.02f)
+#define MPU6050_STATIC_GYRO_TOLERANCE_DPS (0.30f)
+#define MPU6050_SETTLE_ACCEL_TOLERANCE_G  (0.08f)
+#define MPU6050_SETTLE_GYRO_TOLERANCE_DPS (2.0f)
+#define MPU6050_SETTLE_TWO_KP             (4.0f)
+#define MPU6050_INTEGRAL_DECAY            (0.98f)
+#define MPU6050_GYRO_BIAS_ADAPT_ALPHA     (0.001f)
+#define MPU6050_ACCEL_NORM_REF_ALPHA      (0.002f)
 
 /* Private Function Prototypes -----------------------------------------------*/
 static float MPU6050_GetAccelSensitivity(uint8_t range);
@@ -218,6 +223,8 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
   float halfez;
   float accelWeight = 0.0f;
   float accelDelta;
+  float accelNormRatio;
+  float correctionTwoKp;
   float qa;
   float qb;
   float qc;
@@ -284,7 +291,13 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
 
   accelNormSq = (ax * ax) + (ay * ay) + (az * az);
   accelNorm = sqrtf(accelNormSq);
-  accelDelta = fabsf(accelNorm - 1.0f);
+  if (hmpu->accelNormRef <= 0.05f)
+  {
+    hmpu->accelNormRef = accelNorm;
+  }
+
+  accelNormRatio = (hmpu->accelNormRef > 0.05f) ? (accelNorm / hmpu->accelNormRef) : accelNorm;
+  accelDelta = fabsf(accelNormRatio - 1.0f);
   gyroMagDps = sqrtf((hmpu->Data.GyroX * hmpu->Data.GyroX) +
                      (hmpu->Data.GyroY * hmpu->Data.GyroY) +
                      (hmpu->Data.GyroZ * hmpu->Data.GyroZ));
@@ -302,17 +315,21 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
   if ((accelDelta <= MPU6050_STATIC_ACCEL_TOLERANCE_G) &&
       (gyroMagDps <= MPU6050_STATIC_GYRO_TOLERANCE_DPS))
   {
-    hmpu->runtimeGyroBiasX += MPU6050_GYRO_BIAS_ADAPT_ALPHA * hmpu->Data.GyroX;
-    hmpu->runtimeGyroBiasY += MPU6050_GYRO_BIAS_ADAPT_ALPHA * hmpu->Data.GyroY;
-    hmpu->runtimeGyroBiasZ += MPU6050_GYRO_BIAS_ADAPT_ALPHA * hmpu->Data.GyroZ;
+    hmpu->accelNormRef += MPU6050_ACCEL_NORM_REF_ALPHA * (accelNorm - hmpu->accelNormRef);
+    hmpu->runtimeGyroBiasX += MPU6050_GYRO_BIAS_ADAPT_ALPHA *
+                               (hmpu->Data.GyroX - hmpu->runtimeGyroBiasX);
+    hmpu->runtimeGyroBiasY += MPU6050_GYRO_BIAS_ADAPT_ALPHA *
+                               (hmpu->Data.GyroY - hmpu->runtimeGyroBiasY);
+    hmpu->runtimeGyroBiasZ += MPU6050_GYRO_BIAS_ADAPT_ALPHA *
+                               (hmpu->Data.GyroZ - hmpu->runtimeGyroBiasZ);
     gx = (hmpu->Data.GyroX - hmpu->runtimeGyroBiasX) * ((float)M_PI / 180.0f);
     gy = (hmpu->Data.GyroY - hmpu->runtimeGyroBiasY) * ((float)M_PI / 180.0f);
     gz = (hmpu->Data.GyroZ - hmpu->runtimeGyroBiasZ) * ((float)M_PI / 180.0f);
   }
 
   if ((accelNormSq > 0.0f) &&
-      (accelNorm >= MPU6050_ACCEL_GATE_MIN_G) &&
-      (accelNorm <= MPU6050_ACCEL_GATE_MAX_G) &&
+      (accelNormRatio >= MPU6050_ACCEL_GATE_MIN_G) &&
+      (accelNormRatio <= MPU6050_ACCEL_GATE_MAX_G) &&
       (accelWeight > 0.0f))
   {
     recipNorm = MPU6050_InvSqrt(accelNormSq);
@@ -331,7 +348,10 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
     halfey *= accelWeight;
     halfez *= accelWeight;
 
-    if ((hmpu->twoKi > 0.0f) && (accelWeight >= 0.2f))
+    if ((hmpu->twoKi > 0.0f) &&
+        (accelWeight >= 0.9f) &&
+        (accelDelta <= MPU6050_STATIC_ACCEL_TOLERANCE_G) &&
+        (gyroMagDps <= MPU6050_STATIC_GYRO_TOLERANCE_DPS))
     {
       hmpu->integralFBx += hmpu->twoKi * halfex * hmpu->dt;
       hmpu->integralFBy += hmpu->twoKi * halfey * hmpu->dt;
@@ -342,14 +362,22 @@ MPU6050_Status_t MPU6050_UpdateAttitude(MPU6050_Handle_t *hmpu)
     }
     else
     {
-      hmpu->integralFBx = 0.0f;
-      hmpu->integralFBy = 0.0f;
-      hmpu->integralFBz = 0.0f;
+      hmpu->integralFBx *= MPU6050_INTEGRAL_DECAY;
+      hmpu->integralFBy *= MPU6050_INTEGRAL_DECAY;
+      hmpu->integralFBz *= MPU6050_INTEGRAL_DECAY;
     }
 
-    gx += hmpu->twoKp * halfex;
-    gy += hmpu->twoKp * halfey;
-    gz += hmpu->twoKp * halfez;
+    correctionTwoKp = hmpu->twoKp;
+    if ((accelDelta <= MPU6050_SETTLE_ACCEL_TOLERANCE_G) &&
+        (gyroMagDps <= MPU6050_SETTLE_GYRO_TOLERANCE_DPS) &&
+        (correctionTwoKp < MPU6050_SETTLE_TWO_KP))
+    {
+      correctionTwoKp = MPU6050_SETTLE_TWO_KP;
+    }
+
+    gx += correctionTwoKp * halfex;
+    gy += correctionTwoKp * halfey;
+    gz += correctionTwoKp * halfez;
   }
 
   gx *= (0.5f * hmpu->dt);
@@ -448,6 +476,7 @@ static void MPU6050_MahonyInit(MPU6050_Handle_t *hmpu)
   hmpu->runtimeGyroBiasX = 0.0f;
   hmpu->runtimeGyroBiasY = 0.0f;
   hmpu->runtimeGyroBiasZ = 0.0f;
+  hmpu->accelNormRef = 1.0f;
   hmpu->Attitude.Roll = 0.0f;
   hmpu->Attitude.Pitch = 0.0f;
   hmpu->Attitude.Timestamp = 0;
@@ -577,6 +606,7 @@ static MPU6050_Status_t MPU6050_InitAttitudeFromAccel(MPU6050_Handle_t *hmpu)
 
   hmpu->Attitude.Roll = roll_rad * (180.0f / (float)M_PI);
   hmpu->Attitude.Pitch = pitch_rad * (180.0f / (float)M_PI);
+  hmpu->accelNormRef = norm;
   hmpu->Attitude.Timestamp = HAL_GetTick();
   hmpu->Calibration.GyroOffsetX = (int16_t)(gx_sum / (int32_t)sample_count);
   hmpu->Calibration.GyroOffsetY = (int16_t)(gy_sum / (int32_t)sample_count);

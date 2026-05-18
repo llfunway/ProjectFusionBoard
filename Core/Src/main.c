@@ -108,8 +108,6 @@ UART_Proto_Handle_t hUART_Proto;
 static uint32_t lastSensorRead = 0;
 static uint32_t lastTestReport = 0;
 static uint32_t lastImuRead = 0;
-static uint32_t lastAdcOkTick = 0;
-static uint32_t lastImuOkTick = 0;
 
 static float adc_voltage[AD7177_DEVICE_COUNT] = {0.0f};
 static float mag_nt[AD7177_DEVICE_COUNT] = {0.0f};
@@ -188,7 +186,7 @@ static void UART_SendFrequencyInfo(void)
 
 static void UART_SendDataHeader(void)
 {
-  UART_SendString("{text}b1_nT,b2_nT,b3_nT,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,stm32_roll_deg,stm32_pitch_deg\r\n");
+  UART_SendString("{text}b1_nT,b2_nT,b3_nT,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,stm32_roll_deg,stm32_pitch_deg,vertical_raw_nT,vertical_corr_nT\r\n");
 }
 
 static void UART_SendMpuInitDebug(void)
@@ -269,7 +267,6 @@ int main(void)
   imu_pitch = hMPU6050.Attitude.Pitch;
   imu_temperature = hMPU6050.Data.Temp;
   MagResidualFilter_Init(&mag_residual_filter);
-  Process_Sensor_Data();
 
   g_IsInitialized = 1;
   (void)imu_temperature;
@@ -289,7 +286,6 @@ int main(void)
         imu_roll = hMPU6050.Attitude.Roll;
         imu_pitch = hMPU6050.Attitude.Pitch;
         imu_temperature = hMPU6050.Data.Temp;
-        lastImuOkTick = g_SystemTick;
         g_ImuDataFresh = 1;
         g_ImuConsecutiveErrors = 0;
       }
@@ -323,7 +319,6 @@ int main(void)
         {
           adc_voltage[i] = adc_voltage_next[i];
         }
-        lastAdcOkTick = g_SystemTick;
         g_SensorDataFresh = 1;
         g_AdcConsecutiveTimeouts = 0;
       }
@@ -333,9 +328,15 @@ int main(void)
       }
     }
 
-    if (g_SensorDataFresh || g_ImuDataFresh)
+    if (g_SensorDataFresh)
     {
       Process_Sensor_Data();
+      g_SensorDataFresh = 0;
+      g_ImuDataFresh = 0;
+    }
+    else if (g_ImuDataFresh)
+    {
+      g_ImuDataFresh = 0;
     }
 
     if ((g_SystemTick - lastTestReport) >= TEST_REPORT_PERIOD_MS)
@@ -353,8 +354,6 @@ int main(void)
 static void Init_System_Tick(void)
 {
   g_SystemTick = 0;
-  lastAdcOkTick = 0;
-  lastImuOkTick = 0;
 }
 
 static uint8_t Init_All_Drivers(void)
@@ -471,7 +470,8 @@ static void Process_Sensor_Data(void)
   float roll_rad;
   float pitch_rad;
 
-  if (isnan(imu_roll) || isinf(imu_roll) || isnan(imu_pitch) || isinf(imu_pitch))
+  if (isnan(imu_roll) || isinf(imu_roll) ||
+      isnan(imu_pitch) || isinf(imu_pitch))
   {
     roll_rad = 0.0f;
     pitch_rad = 0.0f;
@@ -519,11 +519,11 @@ static void Process_Sensor_Data(void)
 
 static void Process_Test_Report(void)
 {
-  char txBuf[240];
+  char txBuf[280];
   int len = snprintf(
       txBuf,
       sizeof(txBuf),
-      "{plotter}%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\r\n",
+      "{plotter}%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\r\n",
       mag_nt[0],
       mag_nt[1],
       mag_nt[2],
@@ -534,7 +534,9 @@ static void Process_Test_Report(void)
       hMPU6050.Data.GyroY,
       hMPU6050.Data.GyroZ,
       hMPU6050.Attitude.Roll,
-      hMPU6050.Attitude.Pitch);
+      hMPU6050.Attitude.Pitch,
+      vertical_proj_raw,
+      vertical_proj);
 
   UART_SendFormattedBuffer(txBuf, sizeof(txBuf), len, 100);
 }
@@ -561,61 +563,7 @@ static void Handle_Init_Error(uint8_t error_code)
 
 static void Update_Status_LEDs(uint8_t init_error_code)
 {
-  static uint32_t lastRunToggle = 0;
-  static uint32_t lastErrToggle = 0;
-  static GPIO_PinState runState = STATUS_LED_INACTIVE;
-  static GPIO_PinState errState = STATUS_LED_INACTIVE;
-  uint32_t now = g_SystemTick;
-  uint8_t runtime_error = 0;
-
-  if ((now - lastRunToggle) >= STATUS_LED_RUN_PERIOD_MS)
-  {
-    lastRunToggle = now;
-    runState = (runState == STATUS_LED_ACTIVE) ? STATUS_LED_INACTIVE : STATUS_LED_ACTIVE;
-    HAL_GPIO_WritePin(STATUS_LED_RUN_PORT, STATUS_LED_RUN_PIN, runState);
-  }
-
-  if (init_error_code != 0)
-  {
-    HAL_GPIO_WritePin(STATUS_LED_ADC_PORT, STATUS_LED_ADC_PIN, STATUS_LED_INACTIVE);
-    HAL_GPIO_WritePin(STATUS_LED_IMU_PORT, STATUS_LED_IMU_PIN, STATUS_LED_INACTIVE);
-  }
-  else
-  {
-    GPIO_PinState adcState =
-        ((lastAdcOkTick != 0) &&
-         ((now - lastAdcOkTick) <= STATUS_LED_OK_HOLD_MS) &&
-         (g_AdcConsecutiveTimeouts < STATUS_LED_ADC_TIMEOUT_LIMIT))
-            ? STATUS_LED_ACTIVE
-            : STATUS_LED_INACTIVE;
-    GPIO_PinState imuState =
-        ((lastImuOkTick != 0) &&
-         ((now - lastImuOkTick) <= STATUS_LED_OK_HOLD_MS) &&
-         (g_ImuConsecutiveErrors < STATUS_LED_IMU_ERROR_LIMIT))
-            ? STATUS_LED_ACTIVE
-            : STATUS_LED_INACTIVE;
-
-    HAL_GPIO_WritePin(STATUS_LED_ADC_PORT, STATUS_LED_ADC_PIN, adcState);
-    HAL_GPIO_WritePin(STATUS_LED_IMU_PORT, STATUS_LED_IMU_PIN, imuState);
-
-    runtime_error = (g_AdcConsecutiveTimeouts >= STATUS_LED_ADC_TIMEOUT_LIMIT) ||
-                    (g_ImuConsecutiveErrors >= STATUS_LED_IMU_ERROR_LIMIT);
-  }
-
-  if ((init_error_code != 0) || runtime_error)
-  {
-    if ((now - lastErrToggle) >= STATUS_LED_ERR_BLINK_MS)
-    {
-      lastErrToggle = now;
-      errState = (errState == STATUS_LED_ACTIVE) ? STATUS_LED_INACTIVE : STATUS_LED_ACTIVE;
-      HAL_GPIO_WritePin(STATUS_LED_ERR_PORT, STATUS_LED_ERR_PIN, errState);
-    }
-  }
-  else
-  {
-    errState = STATUS_LED_INACTIVE;
-    HAL_GPIO_WritePin(STATUS_LED_ERR_PORT, STATUS_LED_ERR_PIN, STATUS_LED_INACTIVE);
-  }
+  (void)init_error_code;
 }
 
 /* USER CODE END 4 */
@@ -661,24 +609,12 @@ void SystemClock_Config(void)
   */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDefdrift removal GPIO_InitStruct = {0};
 
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-
-  HAL_GPIO_WritePin(STATUS_LED_RUN_PORT, STATUS_LED_RUN_PIN, STATUS_LED_INACTIVE);
-  HAL_GPIO_WritePin(STATUS_LED_ADC_PORT, STATUS_LED_ADC_PIN, STATUS_LED_INACTIVE);
-  HAL_GPIO_WritePin(STATUS_LED_IMU_PORT, STATUS_LED_IMU_PIN, STATUS_LED_INACTIVE);
-  HAL_GPIO_WritePin(STATUS_LED_ERR_PORT, STATUS_LED_ERR_PIN, STATUS_LED_INACTIVE);
-
-  GPIO_InitStruct.Pin = STATUS_LED_RUN_PIN | STATUS_LED_ADC_PIN |
-                        STATUS_LED_IMU_PIN | STATUS_LED_ERR_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   GPIO_InitStruct.Pin = AD7177_CS1_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;

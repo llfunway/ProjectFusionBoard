@@ -38,6 +38,8 @@ gyro_dps = [data.gyro_x, data.gyro_y, data.gyro_z];
 validate_raw_imu_log(acc, gyro_dps, log_file);
 stm32_roll_deg = data.stm32_roll_deg;
 stm32_pitch_deg = data.stm32_pitch_deg;
+stm32_vertical_raw_nT = data.stm32_vertical_raw_nT;
+stm32_vertical_corr_nT = data.stm32_vertical_corr_nT;
 
 n = height(data);
 t = (0:n-1)' * dt;
@@ -60,6 +62,17 @@ vertical_acc = vertical_projection(b, roll_acc_deg, pitch_acc_deg);
 vertical_kalman = vertical_projection(b, roll_kalman_deg, pitch_kalman_deg);
 vertical_mahony = vertical_projection(b, roll_mahony_deg, pitch_mahony_deg);
 vertical_stm32_mahony = vertical_projection_optional(b, stm32_roll_deg, stm32_pitch_deg);
+
+[roll_deploy_src_deg, pitch_deploy_src_deg, deploy_attitude_source] = select_deployable_attitude( ...
+    stm32_roll_deg, stm32_pitch_deg, roll_mahony_deg, pitch_mahony_deg);
+[deploy_delay_s, roll_deploy_delay_deg, pitch_deploy_delay_deg] = optimize_attitude_delay( ...
+    b, roll_deploy_src_deg, pitch_deploy_src_deg, t);
+vertical_deploy_delay = vertical_projection(b, roll_deploy_delay_deg, pitch_deploy_delay_deg);
+[vertical_deploy_nlms, vertical_deploy_rls, vertical_deploy_final, deploy_model] = ...
+    deployable_vertical_pipeline(b, roll_deploy_delay_deg, pitch_deploy_delay_deg, ...
+                                 vertical_deploy_delay, dt);
+deploy_final_lag_s = estimate_signal_lag(vertical_deploy_rls, vertical_deploy_final, dt, 2.0);
+
 [R_mag_to_imu, align_euler_deg, b_aligned] = estimate_mag_to_imu_alignment(b, roll_mahony_deg, pitch_mahony_deg);
 vertical_mahony_aligned = vertical_projection(b_aligned, roll_mahony_deg, pitch_mahony_deg);
 [b_calibrated, mag_calibration] = calibrate_magnetic_axes(b);
@@ -89,6 +102,8 @@ result.roll_mahony_deg = roll_mahony_deg;
 result.pitch_mahony_deg = pitch_mahony_deg;
 result.stm32_roll_deg = stm32_roll_deg;
 result.stm32_pitch_deg = stm32_pitch_deg;
+result.stm32_vertical_raw_nT = stm32_vertical_raw_nT;
+result.stm32_vertical_corr_nT = stm32_vertical_corr_nT;
 result.q_mahony = q_mahony;
 result.R_mag_to_imu = R_mag_to_imu;
 result.align_euler_deg = align_euler_deg;
@@ -104,6 +119,16 @@ result.vertical_acc_nT = vertical_acc;
 result.vertical_kalman_nT = vertical_kalman;
 result.vertical_mahony_nT = vertical_mahony;
 result.vertical_stm32_mahony_nT = vertical_stm32_mahony;
+result.deploy_attitude_source = deploy_attitude_source;
+result.deploy_delay_s = deploy_delay_s;
+result.roll_deploy_delay_deg = roll_deploy_delay_deg;
+result.pitch_deploy_delay_deg = pitch_deploy_delay_deg;
+result.vertical_deploy_delay_nT = vertical_deploy_delay;
+result.vertical_deploy_nlms_nT = vertical_deploy_nlms;
+result.vertical_deploy_rls_nT = vertical_deploy_rls;
+result.vertical_deploy_final_nT = vertical_deploy_final;
+result.deploy_final_lag_s = deploy_final_lag_s;
+result.deploy_model = deploy_model;
 result.vertical_mahony_aligned_nT = vertical_mahony_aligned;
 result.vertical_cal_aligned_nT = vertical_cal_aligned;
 result.vertical_pipeline_nT = vertical_pipeline;
@@ -119,7 +144,7 @@ if fid < 0
 end
 
 cleanup_obj = onCleanup(@() fclose(fid));
-values = zeros(0, 11);
+values = zeros(0, 14);
 
 while true
     line = fgetl(fid);
@@ -145,8 +170,8 @@ while true
     number_tokens = regexp(line, '[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', 'match');
     row = str2double(number_tokens);
 
-    if (numel(row) == 9 || numel(row) == 11) && all(isfinite(row))
-        parsed = nan(1, 11);
+    if (numel(row) == 9 || numel(row) == 11 || numel(row) == 13 || numel(row) == 14) && all(isfinite(row))
+        parsed = nan(1, 14);
         parsed(1:numel(row)) = row(:).';
         values(end + 1, :) = parsed; %#ok<AGROW>
     end
@@ -156,7 +181,9 @@ data = array2table(values, ...
     'VariableNames', {'b1_nT', 'b2_nT', 'b3_nT', ...
                       'acc_x', 'acc_y', 'acc_z', ...
                       'gyro_x', 'gyro_y', 'gyro_z', ...
-                      'stm32_roll_deg', 'stm32_pitch_deg'});
+                      'stm32_roll_deg', 'stm32_pitch_deg', ...
+                      'stm32_vertical_raw_nT', 'stm32_vertical_corr_nT', ...
+                      'stm32_spike_flag'});
 end
 
 function [b_nT, calibration] = apply_voltage_calibration_if_needed(b_input)
@@ -201,6 +228,13 @@ if acc_norm_med > 5 || acc_norm_med < 0.2
            'Please collect a new log after flashing the firmware that prints:\n' ...
            'b1_nT b2_nT b3_nT acc_x acc_y acc_z gyro_x gyro_y gyro_z'], ...
            log_file, acc_norm_med);
+end
+
+if acc_norm_med < 0.75 || acc_norm_med > 1.25
+    warning(['Median |acc| is %.3f g, not close to 1 g. ', ...
+             'This suggests the MPU6050 accelerometer range/sensitivity scale is still mismatched. ', ...
+             'The current firmware gates correction by the startup |acc| reference, but the scale should still be checked.'], ...
+             acc_norm_med);
 end
 
 if any(gyro_abs_med > 2000)
@@ -643,6 +677,193 @@ for i = 1:numel(delay_grid)
 end
 end
 
+function [roll_deg, pitch_deg, source_name] = select_deployable_attitude( ...
+    stm32_roll_deg, stm32_pitch_deg, roll_fallback_deg, pitch_fallback_deg)
+valid_stm32 = isfinite(stm32_roll_deg) & isfinite(stm32_pitch_deg);
+if nnz(valid_stm32) >= max(5, 0.8 * numel(stm32_roll_deg))
+    roll_deg = fill_missing_linear(stm32_roll_deg);
+    pitch_deg = fill_missing_linear(stm32_pitch_deg);
+    source_name = 'stm32 mahony';
+else
+    roll_deg = roll_fallback_deg;
+    pitch_deg = pitch_fallback_deg;
+    source_name = 'offline mahony';
+end
+end
+
+function y = fill_missing_linear(x)
+t = (1:numel(x))';
+valid = isfinite(x);
+if all(valid)
+    y = x;
+elseif any(valid)
+    y = interp1(t(valid), x(valid), t, 'linear', 'extrap');
+else
+    y = zeros(size(x));
+end
+end
+
+function [vertical_nlms, vertical_rls, vertical_final, model] = deployable_vertical_pipeline( ...
+    b_nT, roll_deg, pitch_deg, vertical_nT, dt)
+features = residual_features(b_nT, roll_deg, pitch_deg, vertical_nT);
+trend = lowpass_vector(vertical_nT, dt, 0.20);
+target_residual = vertical_nT - trend;
+
+[vertical_nlms, nlms_model] = nlms_residual_compensate(vertical_nT, features, target_residual);
+[vertical_rls, rls_model] = rls_residual_compensate(vertical_nT, features(:, 1:3), target_residual);
+[vertical_rate_kf, rate_model] = vertical_rate_kalman_filter(vertical_rls, dt, 900.0, 180.0, 0.12);
+vertical_final = vertical_rate_kf;
+
+model = struct();
+model.trend_nT = trend;
+model.features = features;
+model.nlms = nlms_model;
+model.rls = rls_model;
+model.vertical_rate_kalman_nT = vertical_rate_kf;
+model.rate_kalman = rate_model;
+end
+
+function X = residual_features(b_nT, roll_deg, pitch_deg, vertical_nT)
+roll = deg2rad(roll_deg);
+pitch = deg2rad(pitch_deg);
+v = [-sin(pitch), sin(roll) .* cos(pitch), cos(roll) .* cos(pitch)];
+vertical_vec = bsxfun(@times, vertical_nT, v);
+horizontal = b_nT - vertical_vec;
+
+field_scale_nT = 50000;
+hx = horizontal(:, 1) / field_scale_nT;
+hy = horizontal(:, 2) / field_scale_nT;
+hz = horizontal(:, 3) / field_scale_nT;
+X = [hx, hy, hz, hx.^2, hy.^2, hz.^2, hx .* hy, hx .* hz, hy .* hz];
+end
+
+function [vertical_corrected, model] = nlms_residual_compensate(vertical_nT, X, target_residual)
+n = size(X, 1);
+p = size(X, 2);
+w = zeros(p, 1);
+residual_hat = zeros(n, 1);
+mu = 0.08;
+leak = 0.0001;
+eps_norm = 0.05;
+
+for k = 1:n
+    x = X(k, :)';
+    yhat = w' * x;
+    e = target_residual(k) - yhat;
+    residual_hat(k) = yhat;
+    w = (1 - leak) * w + (mu * e / (eps_norm + x' * x)) * x;
+    w = max(-5000, min(5000, w));
+end
+
+vertical_corrected = vertical_nT - residual_hat;
+model.weights = w;
+model.residual_hat_nT = residual_hat;
+end
+
+function [vertical_corrected, model] = rls_residual_compensate(vertical_nT, X, target_residual)
+n = size(X, 1);
+p = size(X, 2);
+w = zeros(p, 1);
+P = eye(p) * 20;
+lambda = 0.999;
+residual_hat = zeros(n, 1);
+
+for k = 1:n
+    x = X(k, :)';
+    yhat = w' * x;
+    e = target_residual(k) - yhat;
+    Px = P * x;
+    gain_den = lambda + x' * Px;
+    K = Px / gain_den;
+    residual_hat(k) = yhat;
+    w = w + K * e;
+    w = max(-2500, min(2500, w));
+    P = (P - K * x' * P) / lambda;
+end
+
+vertical_corrected = vertical_nT - residual_hat;
+model.weights = w;
+model.P = P;
+model.residual_hat_nT = residual_hat;
+model.lambda = lambda;
+end
+
+function [y, model] = vertical_rate_kalman_filter(z, dt, process_accel_nT_s2, measurement_noise_nT, lead_s)
+n = numel(z);
+y = zeros(size(z));
+rate = zeros(size(z));
+state = [z(1); 0];
+P = diag([measurement_noise_nT * measurement_noise_nT, 1000 * 1000]);
+R = measurement_noise_nT * measurement_noise_nT;
+q = process_accel_nT_s2 * process_accel_nT_s2;
+F = [1, dt; 0, 1];
+H = [1, 0];
+Q = q * [0.25 * dt^4, 0.5 * dt^3; 0.5 * dt^3, dt^2];
+y(1) = state(1);
+
+for k = 2:n
+    state = F * state;
+    P = F * P * F' + Q;
+
+    innovation = z(k) - H * state;
+    S = H * P * H' + R;
+    K = P * H' / S;
+    state = state + K * innovation;
+    P = (eye(2) - K * H) * P;
+
+    rate(k) = state(2);
+    y(k) = state(1) + lead_s * state(2);
+end
+
+model = struct();
+model.rate_nT_per_s = rate;
+model.process_accel_nT_s2 = process_accel_nT_s2;
+model.measurement_noise_nT = measurement_noise_nT;
+model.lead_s = lead_s;
+end
+
+function lag_s = estimate_signal_lag(reference, candidate, dt, max_lag_s)
+reference = reference(:);
+candidate = candidate(:);
+valid = isfinite(reference) & isfinite(candidate);
+reference = reference(valid);
+candidate = candidate(valid);
+if numel(reference) < 5
+    lag_s = 0;
+    return;
+end
+
+reference = reference - mean(reference);
+candidate = candidate - mean(candidate);
+max_lag = min(round(max_lag_s / dt), numel(reference) - 2);
+best_score = -Inf;
+best_lag = 0;
+
+for lag = -max_lag:max_lag
+    if lag < 0
+        a = reference(1:end + lag);
+        b = candidate(1 - lag:end);
+    elseif lag > 0
+        a = reference(1 + lag:end);
+        b = candidate(1:end - lag);
+    else
+        a = reference;
+        b = candidate;
+    end
+
+    denom = sqrt(sum(a.^2) * sum(b.^2));
+    if denom > 0
+        score = sum(a .* b) / denom;
+        if score > best_score
+            best_score = score;
+            best_lag = lag;
+        end
+    end
+end
+
+lag_s = best_lag * dt;
+end
+
 function [vertical_corrected, model] = residual_regression_compensate(b_imu, roll_deg, pitch_deg, vertical_nT, dt)
 roll = deg2rad(roll_deg);
 pitch = deg2rad(pitch_deg);
@@ -763,55 +984,57 @@ title('Magnetic field');
 format_report_axes(gca);
 export_report_figure(fig, fullfile(output_dir, '01_magnetic_field.png'));
 
-fig = create_report_figure('Roll');
-plot(r.time_s, r.roll_acc_deg, 'Color', [0.7 0.7 0.7]); hold on;
-plot(r.time_s, r.roll_kalman_deg, 'b');
-plot(r.time_s, r.roll_mahony_deg, 'r');
-if any(isfinite(r.stm32_roll_deg))
-    plot(r.time_s, r.stm32_roll_deg, 'Color', [0.0 0.55 0.0], 'LineStyle', '--');
-    legend('acc', 'kalman', 'offline mahony', 'stm32 mahony', 'Location', 'best');
-else
-    legend('acc', 'kalman', 'offline mahony', 'Location', 'best');
-end
+fig = create_report_figure('STM32 Mahony attitude');
+subplot(2, 1, 1);
+plot(r.time_s, r.stm32_roll_deg, 'Color', [0.0 0.45 0.74]);
 format_report_axes(gca);
-xlabel('Time (s)');
+xlabel('s');
 ylabel('deg');
-title('Roll');
-export_report_figure(fig, fullfile(output_dir, '02_roll.png'));
+title('STM32 Mahony roll');
 
-fig = create_report_figure('Pitch');
-plot(r.time_s, r.pitch_acc_deg, 'Color', [0.7 0.7 0.7]); hold on;
-plot(r.time_s, r.pitch_kalman_deg, 'b');
-plot(r.time_s, r.pitch_mahony_deg, 'r');
-if any(isfinite(r.stm32_pitch_deg))
-    plot(r.time_s, r.stm32_pitch_deg, 'Color', [0.0 0.55 0.0], 'LineStyle', '--');
-    legend('acc', 'kalman', 'offline mahony', 'stm32 mahony', 'Location', 'best');
-else
-    legend('acc', 'kalman', 'offline mahony', 'Location', 'best');
-end
+subplot(2, 1, 2);
+plot(r.time_s, r.stm32_pitch_deg, 'Color', [0.85 0.33 0.10]);
 format_report_axes(gca);
-xlabel('Time (s)');
+xlabel('s');
 ylabel('deg');
-title('Pitch');
-export_report_figure(fig, fullfile(output_dir, '03_pitch.png'));
+title('STM32 Mahony pitch');
+export_report_figure(fig, fullfile(output_dir, '02_stm32_mahony_attitude.png'));
 
 fig = create_report_figure('Vertical magnetic projection');
-plot(r.time_s, r.vertical_acc_nT, 'Color', [0.7 0.7 0.7]); hold on;
-plot(r.time_s, r.vertical_kalman_nT, 'b');
-plot(r.time_s, r.vertical_mahony_nT, 'r');
+plot(r.time_s, r.vertical_kalman_nT, 'b'); hold on;
+legend_entries = {'kalman'};
 if any(isfinite(r.vertical_stm32_mahony_nT))
     plot(r.time_s, r.vertical_stm32_mahony_nT, 'Color', [0.0 0.55 0.0], 'LineStyle', '--');
+    legend_entries{end + 1} = 'stm32 mahony'; %#ok<AGROW>
 end
-if any(isfinite(r.vertical_stm32_mahony_nT))
-    legend('acc', 'kalman', 'offline mahony', 'stm32 mahony', 'Location', 'best');
-else
-    legend('acc', 'kalman', 'offline mahony', 'Location', 'best');
+if any(isfinite(r.stm32_vertical_corr_nT))
+    plot(r.time_s, r.stm32_vertical_corr_nT, 'Color', [0.45 0.0 0.65], 'LineStyle', '-');
+    legend_entries{end + 1} = 'stm32 deployed'; %#ok<AGROW>
 end
+legend(legend_entries, 'Location', 'best');
 xlabel('s');
 ylabel('nT');
 title('Vertical magnetic projection');
 format_report_axes(gca);
 export_report_figure(fig, fullfile(output_dir, '04_vertical_projection.png'));
+
+fig = create_report_figure('B3 and STM32 vertical outputs');
+plot(r.time_s, r.b_nT(:, 3), 'Color', [0.25 0.25 0.25]); hold on;
+legend_entries = {'b3'};
+if any(isfinite(r.vertical_stm32_mahony_nT))
+    plot(r.time_s, r.vertical_stm32_mahony_nT, 'Color', [0.0 0.55 0.0], 'LineStyle', '--');
+    legend_entries{end + 1} = 'stm32 mahony'; %#ok<AGROW>
+end
+if any(isfinite(r.stm32_vertical_corr_nT))
+    plot(r.time_s, r.stm32_vertical_corr_nT, 'Color', [0.45 0.0 0.65], 'LineStyle', '-');
+    legend_entries{end + 1} = 'stm32 deployed'; %#ok<AGROW>
+end
+legend(legend_entries, 'Location', 'best');
+xlabel('s');
+ylabel('nT');
+title('B3 and STM32 vertical outputs');
+format_report_axes(gca);
+export_report_figure(fig, fullfile(output_dir, '03_b3_stm32_vertical.png'));
 
 fprintf('\nSaved report figures to:\n  %s\n', output_dir);
 end
@@ -892,4 +1115,35 @@ if any(isfinite(r.vertical_stm32_mahony_nT))
     fprintf('  stm32 mahony std: %.3f nT, range: %.3f nT\n\n', ...
         std(valid_stm32_vertical), range(valid_stm32_vertical));
 end
+
+fprintf('\nDeployable pipeline without magnetic A/bias or axis R:\n');
+fprintf('  attitude source: %s\n', r.deploy_attitude_source);
+fprintf('  best attitude delay: %.1f ms\n', r.deploy_delay_s * 1000);
+fprintf('  delay only      std: %.3f nT, range: %.3f nT\n', ...
+    std(r.vertical_deploy_delay_nT), range(r.vertical_deploy_delay_nT));
+fprintf('  delay + NLMS    std: %.3f nT, range: %.3f nT\n', ...
+    std(r.vertical_deploy_nlms_nT), range(r.vertical_deploy_nlms_nT));
+fprintf('  delay + RLS     std: %.3f nT, range: %.3f nT\n', ...
+    std(r.vertical_deploy_rls_nT), range(r.vertical_deploy_rls_nT));
+fprintf('  RLS + rate KF std: %.3f nT, range: %.3f nT\n', ...
+    std(r.vertical_deploy_final_nT), range(r.vertical_deploy_final_nT));
+fprintf('  final lag vs RLS estimate: %.1f ms\n', r.deploy_final_lag_s * 1000);
+fprintf('  delay/final linear slope: %.3f / %.3f nT/s\n', ...
+    linear_slope_nT_per_s(r.time_s, r.vertical_deploy_delay_nT), ...
+    linear_slope_nT_per_s(r.time_s, r.vertical_deploy_final_nT));
+if any(isfinite(r.stm32_vertical_corr_nT))
+    valid_stm32_corr = r.stm32_vertical_corr_nT(isfinite(r.stm32_vertical_corr_nT));
+    fprintf('  stm32 deployed std: %.3f nT, range: %.3f nT\n', ...
+        std(valid_stm32_corr), range(valid_stm32_corr));
+end
+end
+
+function slope = linear_slope_nT_per_s(t, x)
+valid = isfinite(t) & isfinite(x);
+if nnz(valid) < 2
+    slope = NaN;
+    return;
+end
+p = polyfit(t(valid), x(valid), 1);
+slope = p(1);
 end
